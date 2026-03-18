@@ -20,6 +20,7 @@ from typing import Any
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.server import TransportSecuritySettings
 
 # Configure logging to stderr (stdout is reserved for MCP protocol)
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
@@ -29,7 +30,9 @@ logger = logging.getLogger("roux")
 # When deployed remotely, disable DNS rebinding protection so the server
 # accepts requests from the cloud hostname (e.g. roux.onrender.com).
 if os.environ.get("ROUX_TRANSPORT") == "streamable-http":
-    mcp = FastMCP("roux", transport_security_enabled=False)
+    mcp = FastMCP("roux", transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    ))
 else:
     mcp = FastMCP("roux")
 
