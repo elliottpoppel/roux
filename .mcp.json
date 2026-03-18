@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "roux": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        ".",
+        "run",
+        "server.py"
+      ],
+      "env": {
+        "ROUX_DEFAULT_LOCATION": "New York, NY"
+      }
+    }
+  }
+}
