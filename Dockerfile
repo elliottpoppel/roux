@@ -12,7 +12,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
 # Copy application code
-COPY server.py CLAUDE.md ./
+COPY server.py personal_auth.py CLAUDE.md ./
 
 # Bake in seed data (places + taste profile)
 RUN mkdir -p /data
