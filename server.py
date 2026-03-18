@@ -59,6 +59,17 @@ TASTE_PROFILE = DATA_DIR / "taste-profile.md"
 GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "")
 DEFAULT_LOCATION = os.environ.get("ROUX_DEFAULT_LOCATION", "")
 
+# On Render, seed data can be injected via secret files at /etc/secrets/.
+# Copy them into DATA_DIR on first run if the database doesn't exist yet.
+SECRETS_DIR = Path("/etc/secrets")
+if SECRETS_DIR.exists() and not PLACES_DB.exists():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    for fname in ("places.json", "taste-profile.md"):
+        src = SECRETS_DIR / fname
+        if src.exists():
+            (DATA_DIR / fname).write_bytes(src.read_bytes())
+            logger.info(f"Loaded seed data from {src}")
+
 # ---------------------------------------------------------------------------
 # Data layer
 # ---------------------------------------------------------------------------

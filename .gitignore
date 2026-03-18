@@ -12,6 +12,7 @@ wheels/
 # Secrets
 .env
 
-# Local data (Takeout exports)
+# Local data (Takeout exports and seed data)
 data/
+seed-data/
 .DS_Store

@@ -14,9 +14,10 @@ RUN uv sync --frozen --no-dev
 # Copy application code
 COPY server.py personal_auth.py CLAUDE.md ./
 
-# Bake in seed data (places + taste profile)
+# Create data directory for places database and taste profile.
+# For personal deployments, put your places.json and taste-profile.md
+# in seed-data/ before building — they'll be baked into the image.
 RUN mkdir -p /data
-COPY seed-data/ /data/
 
 ENV ROUX_DATA_DIR=/data
 ENV ROUX_TRANSPORT=streamable-http
