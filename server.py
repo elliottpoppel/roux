@@ -20,10 +20,17 @@ from typing import Any
 
 import httpx
 from fastmcp import FastMCP
+from mcp.types import Icon
 
 # Configure logging to stderr (stdout is reserved for MCP protocol)
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("roux")
+
+ROUX_ICONS = [Icon(
+    src="https://raw.githubusercontent.com/googlefonts/noto-emoji/main/png/128/emoji_u1f998.png",
+    mimeType="image/png",
+    sizes=["128x128"],
+)]
 
 # Initialize FastMCP server
 # When deployed remotely, use OAuth and disable DNS rebinding protection.
@@ -38,9 +45,9 @@ if os.environ.get("ROUX_TRANSPORT") == "streamable-http":
             ".oauth-state",
         ),
     )
-    mcp = FastMCP("roux", auth=auth)
+    mcp = FastMCP("roux", auth=auth, icons=ROUX_ICONS)
 else:
-    mcp = FastMCP("roux")
+    mcp = FastMCP("roux", icons=ROUX_ICONS)
 
 # ---------------------------------------------------------------------------
 # Configuration
