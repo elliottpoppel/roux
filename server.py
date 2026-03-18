@@ -19,20 +19,26 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.server import TransportSecuritySettings
+from fastmcp import FastMCP
 
 # Configure logging to stderr (stdout is reserved for MCP protocol)
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("roux")
 
 # Initialize FastMCP server
-# When deployed remotely, disable DNS rebinding protection so the server
-# accepts requests from the cloud hostname (e.g. roux.onrender.com).
+# When deployed remotely, use OAuth and disable DNS rebinding protection.
 if os.environ.get("ROUX_TRANSPORT") == "streamable-http":
-    mcp = FastMCP("roux", transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=False,
-    ))
+    from personal_auth import PersonalAuthProvider
+
+    auth = PersonalAuthProvider(
+        base_url=os.environ.get("ROUX_BASE_URL", "https://roux.onrender.com"),
+        password=os.environ.get("ROUX_AUTH_PASSWORD"),
+        state_dir=os.path.join(
+            os.environ.get("ROUX_DATA_DIR", str(Path.home() / ".roux")),
+            ".oauth-state",
+        ),
+    )
+    mcp = FastMCP("roux", auth=auth)
 else:
     mcp = FastMCP("roux")
 
@@ -689,14 +695,14 @@ async def update_taste_profile(updates: str) -> str:
 # ---------------------------------------------------------------------------
 
 # ASGI app for remote deployment (uvicorn server:app)
-app = mcp.streamable_http_app()
+app = mcp.http_app()
 
 
 def main():
     transport = os.environ.get("ROUX_TRANSPORT", "stdio")
     if transport == "streamable-http":
-        import uvicorn
-        uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
+        mcp.run(transport="streamable-http", host="0.0.0.0",
+                port=int(os.environ.get("PORT", "8000")))
     else:
         mcp.run(transport="stdio")
 
