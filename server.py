@@ -34,6 +34,7 @@ mcp = FastMCP("roux")
 
 DATA_DIR = Path(os.environ.get("ROUX_DATA_DIR", Path.home() / ".roux"))
 PLACES_DB = DATA_DIR / "places.json"
+TASTE_PROFILE = DATA_DIR / "taste-profile.md"
 GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "")
 DEFAULT_LOCATION = os.environ.get("ROUX_DEFAULT_LOCATION", "")
 
@@ -80,7 +81,7 @@ def parse_takeout_csv(csv_content: str) -> list[dict]:
     """Parse a Google Takeout saved places CSV file.
 
     Google Takeout exports saved places as CSV with columns:
-    Title, Note, URL, Comment
+    Title, Note, URL, Tags, Comment
     """
     places = []
     reader = csv.DictReader(io.StringIO(csv_content))
@@ -90,6 +91,7 @@ def parse_takeout_csv(csv_content: str) -> list[dict]:
             "name": row.get("Title", "").strip(),
             "note": row.get("Note", "").strip(),
             "url": row.get("URL", "").strip(),
+            "tags": [t.strip() for t in row.get("Tags", "").split(",") if t.strip()],
             "comment": row.get("Comment", "").strip(),
             # These will be enriched later via Google Places API
             "address": "",
@@ -144,7 +146,7 @@ async def enrich_place(place: dict) -> dict:
     params = {
         "input": place["name"] + (" " + place["address"] if place.get("address") else ""),
         "inputtype": "textquery",
-        "fields": "place_id,name,formatted_address,geometry,types,price_level,rating,formatted_phone_number,website,opening_hours,business_status",
+        "fields": "place_id,name,formatted_address,geometry,types,price_level,rating,business_status",
         "key": GOOGLE_PLACES_API_KEY,
     }
 
@@ -315,24 +317,33 @@ async def import_places(csv_content: str, list_name: str = "default") -> str:
 @mcp.tool()
 async def search_my_places(
     query: str = "",
-    cuisine: str = "",
     near: str = "",
     max_distance_miles: float = 0,
     list_name: str = "",
-    limit: int = 10,
+    limit: int = 50,
 ) -> str:
-    """Search through your saved Google Maps places.
+    """Search through the user's saved Google Maps places.
 
-    Use this to find specific types of places from your saved list.
-    Supports filtering by name, cuisine/type, location proximity, and list.
+    IMPORTANT: The 'query' parameter only does simple keyword matching against
+    place names, notes, and Google place types. It does NOT understand what a
+    restaurant serves. For example, searching query='burger' will only find
+    places with 'burger' in the name — it will NOT find a steakhouse that
+    happens to serve great burgers.
+
+    RECOMMENDED APPROACH: For questions about what to eat or drink, use 'near'
+    and/or 'list_name' to get a broad list of saved places in the area, then
+    use YOUR knowledge of these restaurants to identify which ones match what
+    the user is looking for. You know what most well-known restaurants serve —
+    use that knowledge rather than relying on keyword matching.
+
+    Only use 'query' for specific place name lookups (e.g. query='Frenchette').
 
     Args:
-        query: Free-text search across place names and notes (e.g. 'pizza', 'coffee', 'date night').
-        cuisine: Filter by cuisine or place type (e.g. 'italian', 'sushi', 'bar', 'bakery').
+        query: Keyword search across place names and notes. Best for finding a specific place by name. For cuisine/vibe queries, prefer using location filters and applying your own knowledge.
         near: A location to search near (e.g. 'Times Square', 'Shibuya', '10001'). Requires Google Places API key.
         max_distance_miles: Only show places within this distance. Requires 'near' and coordinates. 0 means no limit.
         list_name: Filter to a specific import list (e.g. 'Screenshots', 'Want to go').
-        limit: Maximum number of results to return (default 10).
+        limit: Maximum number of results to return (default 50).
     """
     places = load_places()
     if not places:
@@ -347,19 +358,12 @@ async def search_my_places(
 
     results = []
     query_lower = query.lower()
-    cuisine_lower = cuisine.lower()
 
     for p in places:
         # Text search across name and notes
         if query_lower:
             searchable = f"{p.get('name', '')} {p.get('note', '')} {p.get('comment', '')} {' '.join(p.get('types', []))}".lower()
             if query_lower not in searchable:
-                continue
-
-        # Cuisine/type filter
-        if cuisine_lower:
-            type_text = f"{' '.join(p.get('types', []))} {p.get('name', '')} {p.get('note', '')}".lower()
-            if cuisine_lower not in type_text:
                 continue
 
         # List filter
@@ -643,13 +647,50 @@ async def my_places_stats() -> str:
     return "\n".join(lines)
 
 
+@mcp.tool()
+async def get_taste_profile() -> str:
+    """Get the user's dining taste profile.
+
+    Returns their preferences, patterns, deal-breakers, and dining style.
+    Read this before making recommendations to personalize your suggestions.
+    If no profile exists yet, suggest building one based on their saved places.
+    """
+    if not TASTE_PROFILE.exists():
+        return "No taste profile yet. You can start one by telling me about your preferences, or I can analyze your saved places to generate an initial profile. Just say 'build my taste profile'."
+    return TASTE_PROFILE.read_text()
+
+
+@mcp.tool()
+async def update_taste_profile(updates: str) -> str:
+    """Update the user's dining taste profile with new preferences or feedback.
+
+    Call this when the user shares dining preferences, meal feedback, or
+    patterns you've observed. The profile is a markdown document — append
+    or edit sections as needed.
+
+    Args:
+        updates: The complete updated taste profile content (markdown). This replaces the existing profile, so include all existing content plus your changes.
+    """
+    ensure_data_dir()
+    TASTE_PROFILE.write_text(updates)
+    return "Taste profile updated."
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+# ASGI app for remote deployment (uvicorn server:app)
+app = mcp.streamable_http_app()
+
 
 def main():
-    mcp.run(transport="stdio")
+    transport = os.environ.get("ROUX_TRANSPORT", "stdio")
+    if transport == "streamable-http":
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

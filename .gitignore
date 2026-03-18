@@ -8,3 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Secrets
+.env
+
+# Local data (Takeout exports)
+data/
+.DS_Store
