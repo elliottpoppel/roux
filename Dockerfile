@@ -14,8 +14,9 @@ RUN uv sync --frozen --no-dev
 # Copy application code
 COPY server.py CLAUDE.md ./
 
-# Create data directory
+# Bake in seed data (places + taste profile)
 RUN mkdir -p /data
+COPY seed-data/ /data/
 
 ENV ROUX_DATA_DIR=/data
 ENV ROUX_TRANSPORT=streamable-http
