@@ -26,7 +26,12 @@ logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("roux")
 
 # Initialize FastMCP server
-mcp = FastMCP("roux")
+# When deployed remotely, disable DNS rebinding protection so the server
+# accepts requests from the cloud hostname (e.g. roux.onrender.com).
+if os.environ.get("ROUX_TRANSPORT") == "streamable-http":
+    mcp = FastMCP("roux", transport_security_enabled=False)
+else:
+    mcp = FastMCP("roux")
 
 # ---------------------------------------------------------------------------
 # Configuration
