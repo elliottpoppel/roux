@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 from fastmcp import FastMCP
 from mcp.types import Icon
+import db
 
 # Configure logging to stderr (stdout is reserved for MCP protocol)
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
@@ -288,6 +289,63 @@ async def text_search_api(query: str, location: str = "") -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Expert knowledge helpers
+# ---------------------------------------------------------------------------
+
+
+def format_expert_knowledge(google_place_id: str) -> str:
+    """Return a formatted string of expert knowledge for a place, or empty string."""
+    try:
+        knowledge = db.get_expert_knowledge(google_place_id)
+    except Exception:
+        return ""
+
+    if not knowledge:
+        return ""
+
+    lines = []
+
+    # Dishes
+    dishes = knowledge.get("dishes", [])
+    must_order = [d for d in dishes if d["sentiment"] in ("must_order", "recommended")]
+    skip = [d for d in dishes if d["sentiment"] in ("skip", "overhyped")]
+
+    if must_order:
+        dish_strs = []
+        for d in must_order[:6]:
+            s = d["dish_name"]
+            if d.get("note"):
+                s += f" ({d['note']})"
+            source = d.get("sources", {})
+            if source:
+                s += f" — {source.get('name', '')}"
+            dish_strs.append(s)
+        lines.append(f"  Order: {', '.join(dish_strs)}")
+
+    if skip:
+        skip_strs = [d["dish_name"] for d in skip[:3]]
+        lines.append(f"  Skip: {', '.join(skip_strs)}")
+
+    # Top review summary (highest quality source)
+    reviews = knowledge.get("reviews", [])
+    if reviews:
+        top = reviews[0]
+        source_name = top.get("sources", {}).get("name", "")
+        summary = top.get("summary", "")
+        if summary:
+            lines.append(f"  Expert take ({source_name}): {summary}")
+
+    # Guide mentions
+    mentions = knowledge.get("guide_mentions", [])
+    if mentions:
+        themes = [m.get("guides", {}).get("theme", "") for m in mentions[:3] if m.get("guides", {}).get("theme")]
+        if themes:
+            lines.append(f"  Featured in: {', '.join(themes)}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # MCP Tools
 # ---------------------------------------------------------------------------
 
@@ -425,8 +483,6 @@ async def search_my_places(
         filters = []
         if query:
             filters.append(f"query='{query}'")
-        if cuisine:
-            filters.append(f"cuisine='{cuisine}'")
         if near:
             filters.append(f"near='{near}'")
         if list_name:
@@ -453,6 +509,11 @@ async def search_my_places(
             line += f"\n  List: {p['list']}"
         if p.get("url"):
             line += f"\n  Maps: {p['url']}"
+        # Expert knowledge from shared DB
+        if p.get("place_id"):
+            expert = format_expert_knowledge(p["place_id"])
+            if expert:
+                line += f"\n{expert}"
         lines.append(line)
 
     return "\n\n".join(lines)
@@ -521,10 +582,11 @@ async def get_place_info(place_name: str) -> str:
             for day in hours["weekday_text"]:
                 lines.append(f"  {day}")
 
-    if details.get("reviews"):
-        lines.append(f"\nRecent reviews ({len(details['reviews'])} shown):")
-        for review in details["reviews"][:3]:
-            lines.append(f"  {review.get('rating', '?')}/5 - \"{review.get('text', '')[:150]}...\"")
+    # Expert knowledge from shared DB
+    if place_id:
+        expert = format_expert_knowledge(place_id)
+        if expert:
+            lines.append(f"\nExpert notes:\n{expert}")
 
     if details.get("url"):
         lines.append(f"Google Maps: {details['url']}")
@@ -690,6 +752,38 @@ async def get_taste_profile() -> str:
     if not TASTE_PROFILE.exists():
         return "No taste profile yet. You can start one by telling me about your preferences, or I can analyze your saved places to generate an initial profile. Just say 'build my taste profile'."
     return TASTE_PROFILE.read_text()
+
+
+@mcp.tool()
+async def enrich_place_expert(place_name: str) -> str:
+    """Fetch expert reviews and dish recommendations for a saved place from trusted editorial sources.
+
+    Searches The Infatuation, Eater, Grub Street, NYT, and other approved sources,
+    extracts what to order, what to skip, and stores it in the shared expert database.
+    Results will appear in future searches and get_place_info calls.
+
+    Args:
+        place_name: Name of the saved place to enrich (e.g. "Peter Luger", "Don Angie").
+    """
+    places = load_places()
+    matched = next((p for p in places if place_name.lower() in p.get("name", "").lower()), None)
+    if not matched:
+        return f"No saved place matching '{place_name}'. Use search_my_places to find the exact name."
+
+    if not matched.get("place_id"):
+        return f"'{matched['name']}' doesn't have a Google Place ID yet. Try importing again with a fresh Takeout export."
+
+    try:
+        from enrichment import enrich_one_place
+        success = await enrich_one_place(matched)
+        if success:
+            expert = format_expert_knowledge(matched["place_id"])
+            if expert:
+                return f"Enriched **{matched['name']}**:\n{expert}"
+            return f"Enriched **{matched['name']}** — no editorial coverage found yet."
+        return f"Could not enrich **{matched['name']}** — check that ANTHROPIC_API_KEY is set and the place has editorial coverage."
+    except Exception as e:
+        return f"Enrichment error: {e}"
 
 
 @mcp.tool()
