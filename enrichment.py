@@ -57,11 +57,13 @@ Return a JSON object with these fields:
 - "summary": 2-3 sentence summary of what makes this place worth going to (or not)
 - "sentiment": "positive", "mixed", or "negative" overall sentiment
 - "dishes": list of dish objects, each with:
-    - "name": dish or drink name
+    - "name": the simple, canonical dish name. Use the most common/menu name. Do NOT include brand names, restaurant names, or marketing language. Examples: "Smashburger" not "The Not a Damn Chance Burger", "French Fries" not "Beef Tallow Fries Beast Mode", "Chocolate Chip Cookie" not "Brown Butter Chocolate Chip Cookies". If two items are the same dish (e.g. "double burger" and "cheeseburger" at a place that only has one burger), merge them into one entry.
     - "sentiment": "must_order", "recommended", "skip", "overhyped", or "mixed"
-    - "note": brief context ("lunch only", "seasonal", "not worth the hype", etc.) — can be null
+    - "note": brief context ("lunch only", "seasonal", "not worth the hype", "wagyu beef, American cheese, secret sauce", etc.) — can be null
 - "is_guide": true if this article mentions multiple restaurants (a guide/list), false if single-restaurant review
 - "guide_theme": if is_guide=true, a short description like "Best Burgers in NYC" — else null
+
+IMPORTANT: Keep the dish list tight. Only include genuinely distinct menu items. A place with 3 things on the menu should have ~3 dishes, not 10 variations.
 
 Restaurant: {name}
 Article title: {title}
@@ -321,23 +323,19 @@ async def enrich_one_place(place: dict) -> bool:
 
         review_id = stored_review["id"]
 
-        # Store dishes
+        # Store dishes (dedup: only keep highest-quality source per dish per place)
         dishes = extracted.get("dishes", [])
-        if dishes:
-            dish_records = [
-                {
-                    "expert_place_id": expert_id,
-                    "source_id": source_id,
-                    "review_id": review_id,
-                    "dish_name": d.get("name", ""),
-                    "sentiment": d.get("sentiment", "recommended"),
-                    "note": d.get("note"),
-                }
-                for d in dishes
-                if d.get("name")
-            ]
-            if dish_records:
-                db.insert_dishes(dish_records)
+        for d in dishes:
+            if not d.get("name"):
+                continue
+            db.upsert_dish({
+                "expert_place_id": expert_id,
+                "source_id": source_id,
+                "review_id": review_id,
+                "dish_name": d.get("name", ""),
+                "sentiment": d.get("sentiment", "recommended"),
+                "note": d.get("note"),
+            })
 
         # If this is a guide, capture other places mentioned
         if extracted.get("is_guide") and extracted.get("guide_theme"):

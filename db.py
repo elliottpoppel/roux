@@ -96,6 +96,83 @@ def insert_dishes(dishes: list[dict]):
     db.table("place_dishes").insert(dishes).execute()
 
 
+def _normalize_dish_name(name: str) -> str:
+    """Normalize a dish name for dedup comparison.
+
+    Strips modifiers like 'wagyu', 'double', 'beef tallow' so that
+    'Wagyu Smash Burger' and 'Smashburger' match as the same dish.
+    """
+    import re
+    name = name.strip().lower()
+    # Remove common modifiers that don't change the core dish
+    modifiers = [
+        r'\bwagyu\b', r'\bdouble\b', r'\bsingle\b', r'\bbeef tallow\b',
+        r'\bbrown butter\b', r'\bhouse[- ]?made\b', r'\btexas\b',
+        r'\bjr\.?\b', r'\bjunior\b', r'\bkid\'?s?\b', r'\bchildren\'?s?\b',
+    ]
+    for mod in modifiers:
+        name = re.sub(mod, '', name)
+    # Normalize whitespace and common variations
+    name = re.sub(r'\s+', ' ', name).strip()
+    name = name.replace('smashburger', 'smash burger')
+    name = name.replace('cheeseburger', 'burger')
+    name = name.replace('cheese burger', 'burger')
+    name = name.replace('french fries', 'fries')
+    return name
+
+
+def upsert_dish(dish: dict):
+    """Insert a dish only if a similar one doesn't already exist for this place,
+    or if the new source has a higher quality rank (lower number = better).
+
+    Uses normalized dish names for fuzzy dedup.
+    """
+    client = get_client()
+    if not client:
+        return
+
+    expert_place_id = dish["expert_place_id"]
+    new_normalized = _normalize_dish_name(dish["dish_name"])
+
+    # Get all existing dishes for this place and compare normalized names
+    existing_dishes = (
+        client.table("place_dishes")
+        .select("id, dish_name, source_id, sources(quality_rank)")
+        .eq("expert_place_id", expert_place_id)
+        .execute()
+    )
+
+    match = None
+    for existing in (existing_dishes.data or []):
+        if _normalize_dish_name(existing["dish_name"]) == new_normalized:
+            match = existing
+            break
+
+    if match:
+        # Only replace if new source has better (lower) quality rank
+        old_rank = match.get("sources", {}).get("quality_rank", 999)
+        new_rank = _get_source_rank(dish["source_id"])
+        if new_rank < old_rank:
+            client.table("place_dishes").update({
+                "dish_name": dish["dish_name"],
+                "source_id": dish["source_id"],
+                "review_id": dish["review_id"],
+                "sentiment": dish["sentiment"],
+                "note": dish.get("note"),
+            }).eq("id", match["id"]).execute()
+    else:
+        client.table("place_dishes").insert(dish).execute()
+
+
+def _get_source_rank(source_id: str) -> int:
+    """Get quality rank for a source. Lower = better."""
+    client = get_client()
+    if not client:
+        return 999
+    result = client.table("sources").select("quality_rank").eq("id", source_id).limit(1).execute()
+    return result.data[0]["quality_rank"] if result.data else 999
+
+
 # ---------------------------------------------------------------------------
 # Sources
 # ---------------------------------------------------------------------------
