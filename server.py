@@ -471,7 +471,9 @@ async def search_my_places(
         limit: Maximum number of results to return (default 50).
     """
     user_id = get_current_user_id()
+    logger.info(f"search_my_places: user_id={user_id}")
     places = load_places(user_id)
+    logger.info(f"search_my_places: loaded {len(places)} places")
     if not places:
         return "No places in your database yet. Use import_places to load your Google Takeout export."
 
