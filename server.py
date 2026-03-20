@@ -100,11 +100,8 @@ def get_current_user_id() -> str:
     """Extract a stable user ID from the current auth context."""
     try:
         token = get_access_token()
-        logger.info(f"Auth token: {token}")
         if token is not None:
-            logger.info(f"Client ID: {token.client_id}")
             return db.get_or_create_user(token.client_id)
-        logger.info("No auth token — using local fallback")
     except Exception as e:
         logger.error(f"Auth error: {e}")
     return "local"
@@ -371,44 +368,6 @@ def format_expert_knowledge(google_place_id: str) -> str:
 
 
 @mcp.tool()
-async def debug_connection() -> str:
-    """Test Supabase connectivity. For debugging only."""
-    import time
-    results = []
-
-    # Test 1: Can we reach Supabase at all?
-    url = os.environ.get("SUPABASE_URL", "NOT SET")
-    results.append(f"SUPABASE_URL: {url[:30]}...")
-
-    try:
-        start = time.time()
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(f"{url}/rest/v1/", headers={
-                "apikey": os.environ.get("SUPABASE_SERVICE_ROLE_KEY", ""),
-                "Authorization": f"Bearer {os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '')}",
-            })
-            elapsed = time.time() - start
-            results.append(f"HTTP test: {resp.status_code} in {elapsed:.1f}s")
-    except Exception as e:
-        results.append(f"HTTP test FAILED: {e}")
-
-    # Test 2: Supabase client query
-    try:
-        start = time.time()
-        c = db.get_client()
-        if c:
-            r = c.table("users").select("id", count="exact").execute()
-            elapsed = time.time() - start
-            results.append(f"Supabase query: {r.count} users in {elapsed:.1f}s")
-        else:
-            results.append("Supabase client: None")
-    except Exception as e:
-        results.append(f"Supabase query FAILED: {e}")
-
-    return "\n".join(results)
-
-
-@mcp.tool()
 async def import_places(csv_content: str, list_name: str = "default") -> str:
     """Import saved places from a Google Takeout CSV file.
 
@@ -509,9 +468,7 @@ async def search_my_places(
         limit: Maximum number of results to return (default 50).
     """
     user_id = get_current_user_id()
-    logger.info(f"search_my_places: user_id={user_id}")
     places = load_places(user_id)
-    logger.info(f"search_my_places: loaded {len(places)} places")
     if not places:
         return "No places in your database yet. Use import_places to load your Google Takeout export."
 
