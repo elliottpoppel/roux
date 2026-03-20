@@ -177,6 +177,30 @@ def get_expert_knowledge(google_place_id: str) -> dict | None:
     }
 
 
+def search_dishes_by_keyword(keyword: str) -> set[str]:
+    """Return Google Place IDs of places whose expert dishes match a keyword.
+
+    Used by search_my_places to expand keyword search beyond place names/notes
+    into the expert dish database.
+    """
+    db = get_client()
+    if not db:
+        return set()
+
+    result = (
+        db.table("place_dishes")
+        .select("expert_place_id, expert_places(google_place_id)")
+        .ilike("dish_name", f"%{keyword}%")
+        .limit(100)
+        .execute()
+    )
+    return {
+        r["expert_places"]["google_place_id"]
+        for r in (result.data or [])
+        if r.get("expert_places", {}).get("google_place_id")
+    }
+
+
 def search_expert_by_dish(dish_query: str, city: str | None = None) -> list[dict]:
     """Find expert places known for a specific dish or drink."""
     db = get_client()

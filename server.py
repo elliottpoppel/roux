@@ -412,26 +412,20 @@ async def search_my_places(
     list_name: str = "",
     limit: int = 50,
 ) -> str:
-    """Search through the user's saved Google Maps places.
+    """Search through the user's saved places AND expert knowledge database.
 
-    IMPORTANT: The 'query' parameter only does simple keyword matching against
-    place names, notes, and Google place types. It does NOT understand what a
-    restaurant serves. For example, searching query='burger' will only find
-    places with 'burger' in the name — it will NOT find a steakhouse that
-    happens to serve great burgers.
+    ALWAYS call this tool FIRST before discover_places. This searches the user's
+    saved places, their notes, AND the expert database (editorial reviews, dish
+    recommendations from NYT, Infatuation, Eater, etc.).
 
-    RECOMMENDED APPROACH: For questions about what to eat or drink, use 'near'
-    and/or 'list_name' to get a broad list of saved places in the area, then
-    use YOUR knowledge of these restaurants to identify which ones match what
-    the user is looking for. You know what most well-known restaurants serve —
-    use that knowledge rather than relying on keyword matching.
-
-    Only use 'query' for specific place name lookups (e.g. query='Frenchette').
+    The query parameter searches across: place names, user notes, Google place
+    types, AND expert dish data. So searching 'burger' WILL find a steakhouse
+    that serves great burgers if editorial sources mention it.
 
     Args:
-        query: Keyword search across place names and notes. Best for finding a specific place by name. For cuisine/vibe queries, prefer using location filters and applying your own knowledge.
-        near: A location to search near (e.g. 'Times Square', 'Shibuya', '10001'). Requires Google Places API key.
-        max_distance_miles: Only show places within this distance. Requires 'near' and coordinates. 0 means no limit.
+        query: Search across place names, notes, types, and expert dish data (e.g. 'burger', 'pizza by the slice', 'natural wine').
+        near: A location to search near (e.g. 'Times Square', 'Shibuya', '10001').
+        max_distance_miles: Only show places within this distance. 0 means no limit.
         list_name: Filter to a specific import list (e.g. 'Screenshots', 'Want to go').
         limit: Maximum number of results to return (default 50).
     """
@@ -446,6 +440,14 @@ async def search_my_places(
         if not near_coords and DEFAULT_LOCATION:
             near_coords = await geocode_location(DEFAULT_LOCATION)
 
+    # If there's a query, also search expert dish data for matching place IDs
+    expert_match_ids = set()
+    if query:
+        try:
+            expert_match_ids = db.search_dishes_by_keyword(query.lower())
+        except Exception:
+            pass
+
     results = []
     query_lower = query.lower()
 
@@ -453,7 +455,9 @@ async def search_my_places(
         # Text search across name and notes
         if query_lower:
             searchable = f"{p.get('name', '')} {p.get('note', '')} {p.get('comment', '')} {' '.join(p.get('types', []))}".lower()
-            if query_lower not in searchable:
+            name_match = query_lower in searchable
+            expert_match = p.get("place_id") in expert_match_ids
+            if not name_match and not expert_match:
                 continue
 
         # List filter
@@ -601,10 +605,11 @@ async def discover_places(
     radius_miles: float = 2.0,
     include_saved: bool = True,
 ) -> str:
-    """Discover new places beyond your saved list using Google Places search.
+    """Discover new places beyond the user's saved list using Google Places search.
 
-    Use this when the user wants recommendations that might not be in their
-    saved places, or when searching for something specific in a location.
+    IMPORTANT: Always call search_my_places FIRST. Only use this tool to
+    supplement saved places with additional suggestions, or when the user
+    explicitly asks for places they haven't saved.
 
     Args:
         query: What to search for (e.g. 'best pizza by the slice', 'trendy cocktail bar', 'late night ramen').
