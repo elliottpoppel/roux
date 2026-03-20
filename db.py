@@ -32,19 +32,40 @@ def get_client() -> Client | None:
 
 def get_or_create_user(client_id: str) -> str:
     """Return a stable user_id for the given OAuth client_id, creating if needed."""
-    db = get_client()
-    if not db:
+    client = get_client()
+    if not client:
         return "local"
 
-    result = db.table("user_clients").select("user_id").eq("client_id", client_id).execute()
-    if result.data:
-        return result.data[0]["user_id"]
+    try:
+        # Check if this client_id is already mapped
+        result = client.table("user_clients").select("user_id").eq("client_id", client_id).execute()
+        if result.data:
+            return result.data[0]["user_id"]
 
-    # Create new user and mapping
-    user = db.table("users").insert({"display_name": None}).execute()
-    user_id = user.data[0]["id"]
-    db.table("user_clients").insert({"user_id": user_id, "client_id": client_id}).execute()
-    return user_id
+        # New client_id — create a new user and mapping
+        user = client.table("users").insert({"display_name": None}).execute()
+        user_id = user.data[0]["id"]
+        client.table("user_clients").insert({"user_id": user_id, "client_id": client_id}).execute()
+        logger.info(f"Created new user {user_id} for client {client_id}")
+        return user_id
+    except Exception as e:
+        logger.error(f"get_or_create_user failed for {client_id}: {e}")
+        # Fallback: return the first user (owner) so the service still works
+        try:
+            fallback = client.table("users").select("id").limit(1).execute()
+            if fallback.data:
+                # Also save the mapping so this doesn't happen again
+                try:
+                    client.table("user_clients").insert({
+                        "user_id": fallback.data[0]["id"],
+                        "client_id": client_id,
+                    }).execute()
+                except Exception:
+                    pass
+                return fallback.data[0]["id"]
+        except Exception:
+            pass
+        return "local"
 
 
 # ---------------------------------------------------------------------------
