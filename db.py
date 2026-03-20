@@ -141,6 +141,23 @@ def delete_user_places(user_id: str, place_ids: list[str]):
 # ---------------------------------------------------------------------------
 
 
+def get_user_default_location(user_id: str) -> str:
+    """Get the user's default location."""
+    client = get_client()
+    if not client:
+        return ""
+    result = client.table("users").select("default_location").eq("id", user_id).execute()
+    return result.data[0]["default_location"] if result.data and result.data[0].get("default_location") else ""
+
+
+def set_user_default_location(user_id: str, location: str):
+    """Set the user's default location."""
+    client = get_client()
+    if not client:
+        return
+    client.table("users").update({"default_location": location}).eq("id", user_id).execute()
+
+
 def get_user_taste_profile(user_id: str) -> str | None:
     """Get the taste profile content for a user."""
     db = get_client()

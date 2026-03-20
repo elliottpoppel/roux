@@ -47,6 +47,9 @@ On first message in a conversation, greet the user by first name and introduce \
 yourself: "Hey [name] — **🦘 Roux** here." After that, only reference Roux by \
 name when it comes up naturally.
 
+If the user has no default location set yet, ask where they're based so you \
+can set it with set_default_location. This only needs to happen once.
+
 **How to respond:**
 - Voice: Direct, knowledgeable friend. Not a food critic. No "elevated" or "curated."
 - search_my_places is the primary tool — it returns saved places AND discoveries.
@@ -554,12 +557,13 @@ async def search_my_places(
     if not places:
         return "No places in your database yet. Use import_places to load your Google Takeout export."
 
-    # Resolve 'near' to coordinates
+    # Resolve 'near' to coordinates — fall back to user's default location
     near_coords = None
-    if near:
-        near_coords = await geocode_location(near)
-        if not near_coords and DEFAULT_LOCATION:
-            near_coords = await geocode_location(DEFAULT_LOCATION)
+    effective_near = near
+    if not effective_near:
+        effective_near = db.get_user_default_location(user_id) or DEFAULT_LOCATION
+    if effective_near:
+        near_coords = await geocode_location(effective_near)
 
     # If there's a query, also search expert dish data for matching place IDs
     expert_match_ids = set()
@@ -911,6 +915,22 @@ async def enrich_place_expert(place_name: str) -> str:
         return f"Could not enrich **{matched['name']}** — check that ANTHROPIC_API_KEY is set and the place has editorial coverage."
     except Exception as e:
         return f"Enrichment error: {e}"
+
+
+@mcp.tool()
+async def set_default_location(location: str) -> str:
+    """Set the user's default/home location for 'near me' queries.
+
+    Call this when the user shares where they live or their home base.
+    This location is used as the default for all searches when no
+    specific location is mentioned.
+
+    Args:
+        location: The user's home location (e.g. 'West Village, NYC', '123 Main St, Brooklyn, NY').
+    """
+    user_id = get_current_user_id()
+    db.set_user_default_location(user_id, location)
+    return f"Default location set to: {location}. All 'near me' queries will use this unless you specify a different location."
 
 
 @mcp.tool()
