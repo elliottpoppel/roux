@@ -20,8 +20,11 @@ def get_client() -> Client | None:
     if _client is None:
         url = os.environ.get("SUPABASE_URL")
         key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        logger.info(f"Supabase URL: {url[:30] + '...' if url else 'NOT SET'}")
+        logger.info(f"Supabase key: {'SET (' + key[:10] + '...)' if key else 'NOT SET'}")
         if url and key:
             _client = create_client(url, key)
+            logger.info("Supabase client created")
     return _client
 
 
