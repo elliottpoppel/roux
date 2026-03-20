@@ -36,35 +36,35 @@ def get_or_create_user(client_id: str) -> str:
     if not client:
         return "local"
 
-    try:
-        # Check if this client_id is already mapped
-        result = client.table("user_clients").select("user_id").eq("client_id", client_id).execute()
-        if result.data:
-            return result.data[0]["user_id"]
+    # Check if this client_id is already mapped
+    result = client.table("user_clients").select("user_id").eq("client_id", client_id).execute()
+    if result.data:
+        return result.data[0]["user_id"]
 
-        # New client_id — create a new user and mapping
+    # Unknown client_id — check if there's only one user (single-tenant mode)
+    all_users = client.table("users").select("id").execute()
+    if all_users.data and len(all_users.data) == 1:
+        # Single user — auto-link this client_id to them
+        user_id = all_users.data[0]["id"]
+        logger.info(f"Auto-linking client {client_id} to sole user {user_id}")
+        try:
+            client.table("user_clients").insert({
+                "user_id": user_id,
+                "client_id": client_id,
+            }).execute()
+        except Exception as e:
+            logger.warning(f"Failed to save client mapping: {e}")
+        return user_id
+
+    # Multi-user: create a new user
+    try:
         user = client.table("users").insert({"display_name": None}).execute()
         user_id = user.data[0]["id"]
         client.table("user_clients").insert({"user_id": user_id, "client_id": client_id}).execute()
         logger.info(f"Created new user {user_id} for client {client_id}")
         return user_id
     except Exception as e:
-        logger.error(f"get_or_create_user failed for {client_id}: {e}")
-        # Fallback: return the first user (owner) so the service still works
-        try:
-            fallback = client.table("users").select("id").limit(1).execute()
-            if fallback.data:
-                # Also save the mapping so this doesn't happen again
-                try:
-                    client.table("user_clients").insert({
-                        "user_id": fallback.data[0]["id"],
-                        "client_id": client_id,
-                    }).execute()
-                except Exception:
-                    pass
-                return fallback.data[0]["id"]
-        except Exception:
-            pass
+        logger.error(f"get_or_create_user failed: {e}")
         return "local"
 
 
