@@ -491,15 +491,15 @@ async def search_my_places(
     list_name: str = "",
     limit: int = 50,
 ) -> str:
-    """Search through the user's saved places AND expert knowledge database.
+    """Search the user's saved places AND discover new ones — all in one call.
 
-    ALWAYS call this tool FIRST before discover_places. This searches the user's
-    saved places, their notes, AND the expert database (editorial reviews, dish
-    recommendations from NYT, Infatuation, Eater, etc.).
+    This is the PRIMARY tool for any dining question. It searches saved places,
+    user notes, and expert dish data (NYT, Infatuation, Eater, etc.). When a
+    location is provided, it also automatically discovers nearby places the user
+    hasn't saved yet.
 
-    The query parameter searches across: place names, user notes, Google place
-    types, AND expert dish data. So searching 'burger' WILL find a steakhouse
-    that serves great burgers if editorial sources mention it.
+    Returns saved places first, then new discoveries. No need to call
+    discover_places separately — this tool does both.
 
     Args:
         query: Search across place names, notes, types, and expert dish data (e.g. 'burger', 'pizza by the slice', 'natural wine').
@@ -575,11 +575,13 @@ async def search_my_places(
             filters.append(f"list='{list_name}'")
         return f"No saved places match your search ({', '.join(filters)}). Try broadening your criteria, or use discover_places to search beyond your saved list."
 
-    # Format output
-    lines = [f"Found {len(results)} saved place(s):\n"]
+    # Format saved places output
+    lines = [f"**From your saved places** ({len(results)} match):\n"]
+    saved_names = set()
     for r in results:
         p = r["place"]
-        line = f"**{p['name']}**"
+        saved_names.add(p.get("name", "").lower())
+        line = f"**{p['name']}** (saved)"
         if p.get("address"):
             line += f"\n  Address: {p['address']}"
         if p.get("rating"):
@@ -601,6 +603,29 @@ async def search_my_places(
             if expert:
                 line += f"\n{expert}"
         lines.append(line)
+
+    # Auto-discover new places if a location is provided
+    if near and GOOGLE_PLACES_API_KEY:
+        search_query = query or "restaurant"
+        geo = near_coords or await geocode_location(near)
+        if geo:
+            discovery = await search_nearby_api(geo["lat"], geo["lng"], query=search_query, radius=3000)
+            if not discovery:
+                discovery = await text_search_api(f"{search_query} near {near}")
+            # Filter out places already in saved results
+            new_places = [r for r in discovery if r.get("name", "").lower() not in saved_names][:5]
+            if new_places:
+                lines.append("\n**Places you haven't saved that might be worth knowing about:**\n")
+                for r in new_places:
+                    line = f"**{r.get('name', 'Unknown')}**"
+                    if r.get("vicinity") or r.get("formatted_address"):
+                        line += f"\n  Address: {r.get('vicinity') or r.get('formatted_address')}"
+                    if r.get("rating"):
+                        price = "$" * r["price_level"] if r.get("price_level") else ""
+                        line += f"\n  Rating: {r['rating']}/5" + (f" | Price: {price}" if price else "")
+                    if r.get("opening_hours", {}).get("open_now") is not None:
+                        line += f"\n  Open now: {'Yes' if r['opening_hours']['open_now'] else 'No'}"
+                    lines.append(line)
 
     return "\n\n".join(lines)
 
