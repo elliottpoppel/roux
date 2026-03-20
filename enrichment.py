@@ -71,24 +71,26 @@ Article text:
 Return only valid JSON, no other text."""
 
 
-async def google_search(query: str, num: int = 5) -> list[dict]:
-    """Search using Google Custom Search API restricted to approved editorial sources."""
-    cx = os.environ.get("GOOGLE_CUSTOM_SEARCH_CX", "")
-    if not GOOGLE_API_KEY or not cx:
-        logger.warning("No GOOGLE_CUSTOM_SEARCH_CX set — skipping enrichment")
+def web_search(query: str, num: int = 5) -> list[dict]:
+    """Search using Brave Search API — free tier, 2000 queries/month."""
+    api_key = os.environ.get("BRAVE_SEARCH_API_KEY", "")
+    if not api_key:
+        logger.warning("No BRAVE_SEARCH_API_KEY set — skipping search")
         return []
 
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {"q": query, "key": GOOGLE_API_KEY, "cx": cx, "num": num}
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.get(url, params=params, timeout=10.0)
-            resp.raise_for_status()
-            items = resp.json().get("items", [])
-            return [{"title": i.get("title", ""), "url": i.get("link", ""),
-                     "snippet": i.get("snippet", "")} for i in items]
-        except Exception as e:
-            logger.error(f"Google Custom Search error: {e}")
+    try:
+        resp = httpx.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            params={"q": query, "count": num},
+            headers={"X-Subscription-Token": api_key, "Accept": "application/json"},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("web", {}).get("results", [])
+        return [{"title": r.get("title", ""), "url": r.get("url", ""),
+                 "snippet": r.get("description", "")} for r in results]
+    except Exception as e:
+        logger.error(f"Brave Search error: {e}")
     return []
 
 
@@ -266,9 +268,14 @@ async def enrich_one_place(place: dict) -> bool:
 
     logger.info(f"Enriching: {name}")
 
-    # Search for reviews across approved sources
-    query = f'"{name}" {city} restaurant'
-    search_results = await google_search(query, num=5)
+    # Search for reviews — one query with site: filter for approved domains
+    sites = " OR ".join(f"site:{d}" for d in SOURCE_DOMAINS)
+    query = f'"{name}" ({sites})'
+    search_results = web_search(query, num=10)
+    if search_results:
+        # Filter to only approved domains (belt and suspenders)
+        search_results = [r for r in search_results if any(d in r.get("url", "") for d in SOURCE_DOMAINS)]
+        logger.info(f"  Found {len(search_results)} editorial results")
 
     if not search_results:
         logger.info(f"No search results for {name}")
@@ -385,7 +392,7 @@ async def run_enrichment(filter_name: str | None = None, force: bool = False):
                 success += 1
         except Exception as e:
             logger.error(f"Error enriching {place.get('name')}: {e}")
-        await asyncio.sleep(1)  # Be respectful to sources
+        await asyncio.sleep(2)  # Be respectful to search engine
 
     logger.info(f"Enrichment complete: {success}/{len(places)} places enriched")
 
