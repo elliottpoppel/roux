@@ -42,6 +42,7 @@ GOOGLE_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "")
 # Sources to search per place (in priority order)
 SOURCE_DOMAINS = [
     "nytimes.com",
+    "guide.michelin.com",
     "theinfatuation.com",
     "grubstreet.com",
     "eater.com",
@@ -49,6 +50,7 @@ SOURCE_DOMAINS = [
     "tastingtable.com",
     "seriouseats.com",
     "timeout.com",
+    "thrillist.com",
 ]
 
 EXTRACTION_PROMPT = """You are extracting structured data from a restaurant review or guide.
@@ -215,10 +217,12 @@ def get_source_id_for_url(url: str) -> str | None:
         "eater.com": "Eater New York",
         "grubstreet.com": "Grub Street",
         "nytimes.com": "The New York Times",
+        "guide.michelin.com": "Michelin Guide",
         "bonappetit.com": "Bon Appétit",
         "tastingtable.com": "Tasting Table",
         "seriouseats.com": "Serious Eats",
         "timeout.com": "Time Out New York",
+        "thrillist.com": "Thrillist",
     }
     for domain, name in domain_to_name.items():
         if domain in url:
