@@ -362,6 +362,79 @@ def format_expert_knowledge(google_place_id: str) -> str:
     return "\n".join(lines)
 
 
+def _extract_neighborhood(address: str) -> str:
+    """Pull a short neighborhood/city from a full address."""
+    if not address:
+        return ""
+    parts = [p.strip() for p in address.split(",")]
+    if len(parts) >= 3:
+        return parts[-3] if len(parts) >= 4 else parts[-2]
+    return parts[0] if parts else ""
+
+
+def format_place_card(p: dict, distance: float | None = None, saved: bool = False) -> str:
+    """Format a place as a consistent card.
+
+    **Place Name** · 4.5★ · $$ · West Village (saved)
+    Your note context enriched with expert knowledge.
+    → Order: specific dishes
+    → Practical detail if vital
+    """
+    # Header line: name · rating · price · location
+    parts = [f"**{p.get('name', 'Unknown')}**"]
+    if p.get("rating"):
+        parts.append(f"{p['rating']}★")
+    if p.get("price_level"):
+        parts.append("$" * p["price_level"])
+    if distance is not None:
+        parts.append(f"{distance:.1f} mi")
+    elif p.get("address"):
+        neighborhood = _extract_neighborhood(p["address"])
+        if neighborhood:
+            parts.append(neighborhood)
+    if saved:
+        parts.append("saved")
+    line = " · ".join(parts)
+
+    # Address
+    if p.get("address"):
+        line += f"\n{p['address']}"
+
+    # User note
+    if p.get("note"):
+        line += f"\nYour note: {p['note']}"
+
+    # Expert knowledge
+    if p.get("place_id"):
+        expert = format_expert_knowledge(p["place_id"])
+        if expert:
+            line += f"\n{expert}"
+
+    return line
+
+
+def format_discovery_card(r: dict) -> str:
+    """Format a Google Places discovery result as a card."""
+    parts = [f"**{r.get('name', 'Unknown')}**"]
+    if r.get("rating"):
+        parts.append(f"{r['rating']}★")
+    if r.get("price_level"):
+        parts.append("$" * r["price_level"])
+    address = r.get("vicinity") or r.get("formatted_address", "")
+    if address:
+        neighborhood = _extract_neighborhood(address)
+        if neighborhood:
+            parts.append(neighborhood)
+    line = " · ".join(parts)
+
+    if address:
+        line += f"\n{address}"
+    if r.get("opening_hours", {}).get("open_now") is not None:
+        line += f"\nOpen now: {'Yes' if r['opening_hours']['open_now'] else 'No'}"
+
+    return line
+
+
 # ---------------------------------------------------------------------------
 # MCP Tools
 # ---------------------------------------------------------------------------
@@ -532,34 +605,13 @@ async def search_my_places(
             filters.append(f"list='{list_name}'")
         return f"No saved places match your search ({', '.join(filters)}). Try broadening your criteria, or use discover_places to search beyond your saved list."
 
-    # Format saved places output
+    # Format saved places as cards
     lines = [f"**From your saved places** ({len(results)} match):\n"]
     saved_names = set()
     for r in results:
         p = r["place"]
         saved_names.add(p.get("name", "").lower())
-        line = f"**{p['name']}** (saved)"
-        if p.get("address"):
-            line += f"\n  Address: {p['address']}"
-        if p.get("rating"):
-            price = "$" * p["price_level"] if p.get("price_level") else ""
-            line += f"\n  Rating: {p['rating']}/5" + (f" | Price: {price}" if price else "")
-        if p.get("note"):
-            line += f"\n  Your note: {p['note']}"
-        if p.get("comment"):
-            line += f"\n  Comment: {p['comment']}"
-        if r.get("distance") is not None:
-            line += f"\n  Distance: {r['distance']:.1f} miles away"
-        if p.get("list"):
-            line += f"\n  List: {p['list']}"
-        if p.get("url"):
-            line += f"\n  Maps: {p['url']}"
-        # Expert knowledge from shared DB
-        if p.get("place_id"):
-            expert = format_expert_knowledge(p["place_id"])
-            if expert:
-                line += f"\n{expert}"
-        lines.append(line)
+        lines.append(format_place_card(p, r.get("distance"), saved=True))
 
     # Auto-discover new places if a location is provided
     if near and GOOGLE_PLACES_API_KEY:
@@ -569,20 +621,11 @@ async def search_my_places(
             discovery = await search_nearby_api(geo["lat"], geo["lng"], query=search_query, radius=3000)
             if not discovery:
                 discovery = await text_search_api(f"{search_query} near {near}")
-            # Filter out places already in saved results
             new_places = [r for r in discovery if r.get("name", "").lower() not in saved_names][:5]
             if new_places:
-                lines.append("\n**Places you haven't saved that might be worth knowing about:**\n")
+                lines.append("\n**You might also like:**\n")
                 for r in new_places:
-                    line = f"**{r.get('name', 'Unknown')}**"
-                    if r.get("vicinity") or r.get("formatted_address"):
-                        line += f"\n  Address: {r.get('vicinity') or r.get('formatted_address')}"
-                    if r.get("rating"):
-                        price = "$" * r["price_level"] if r.get("price_level") else ""
-                        line += f"\n  Rating: {r['rating']}/5" + (f" | Price: {price}" if price else "")
-                    if r.get("opening_hours", {}).get("open_now") is not None:
-                        line += f"\n  Open now: {'Yes' if r['opening_hours']['open_now'] else 'No'}"
-                    lines.append(line)
+                    lines.append(format_discovery_card(r))
 
     return "\n\n".join(lines)
 
