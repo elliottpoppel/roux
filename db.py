@@ -1,6 +1,7 @@
 """
 Roux — Supabase database client.
-Handles all reads/writes to the shared expert knowledge base.
+Handles all reads/writes to the shared expert knowledge base
+and per-user data (places, taste profiles).
 """
 
 import os
@@ -22,6 +23,94 @@ def get_client() -> Client | None:
         if url and key:
             _client = create_client(url, key)
     return _client
+
+
+# ---------------------------------------------------------------------------
+# User identity
+# ---------------------------------------------------------------------------
+
+
+def get_or_create_user(client_id: str) -> str:
+    """Return a stable user_id for the given OAuth client_id, creating if needed."""
+    db = get_client()
+    if not db:
+        return "local"
+
+    result = db.table("user_clients").select("user_id").eq("client_id", client_id).execute()
+    if result.data:
+        return result.data[0]["user_id"]
+
+    # Create new user and mapping
+    user = db.table("users").insert({"display_name": None}).execute()
+    user_id = user.data[0]["id"]
+    db.table("user_clients").insert({"user_id": user_id, "client_id": client_id}).execute()
+    return user_id
+
+
+# ---------------------------------------------------------------------------
+# User places (per-user, private)
+# ---------------------------------------------------------------------------
+
+
+def load_user_places(user_id: str, list_name: str | None = None) -> list[dict]:
+    """Load all saved places for a user, optionally filtered by list."""
+    db = get_client()
+    if not db:
+        return []
+    q = db.table("user_places").select("*").eq("user_id", user_id)
+    if list_name:
+        q = q.eq("list", list_name)
+    return q.execute().data or []
+
+
+def upsert_user_places(user_id: str, places: list[dict]):
+    """Insert or update places for a user. Dedup by (user_id, name, url)."""
+    db = get_client()
+    if not db:
+        return
+    for p in places:
+        p["user_id"] = user_id
+    db.table("user_places").upsert(places, on_conflict="user_id,name,url").execute()
+
+
+def update_user_place(place_id: str, updates: dict):
+    """Update a single user place by its row ID."""
+    db = get_client()
+    if not db:
+        return
+    db.table("user_places").update(updates).eq("id", place_id).execute()
+
+
+def delete_user_places(user_id: str, place_ids: list[str]):
+    """Remove places by their row IDs, scoped to user."""
+    db = get_client()
+    if not db or not place_ids:
+        return
+    db.table("user_places").delete().in_("id", place_ids).eq("user_id", user_id).execute()
+
+
+# ---------------------------------------------------------------------------
+# User taste profiles (per-user, private)
+# ---------------------------------------------------------------------------
+
+
+def get_user_taste_profile(user_id: str) -> str | None:
+    """Get the taste profile content for a user."""
+    db = get_client()
+    if not db:
+        return None
+    result = db.table("user_taste_profiles").select("content").eq("user_id", user_id).execute()
+    return result.data[0]["content"] if result.data else None
+
+
+def upsert_user_taste_profile(user_id: str, content: str):
+    """Create or update a user's taste profile."""
+    db = get_client()
+    if not db:
+        return
+    db.table("user_taste_profiles").upsert(
+        {"user_id": user_id, "content": content}, on_conflict="user_id"
+    ).execute()
 
 
 # ---------------------------------------------------------------------------

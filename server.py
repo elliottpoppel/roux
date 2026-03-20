@@ -20,6 +20,7 @@ from typing import Any
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_access_token
 from mcp.types import Icon
 import db
 
@@ -86,46 +87,30 @@ else:
 # Configuration
 # ---------------------------------------------------------------------------
 
-DATA_DIR = Path(os.environ.get("ROUX_DATA_DIR", Path.home() / ".roux"))
-PLACES_DB = DATA_DIR / "places.json"
-TASTE_PROFILE = DATA_DIR / "taste-profile.md"
 GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "")
 DEFAULT_LOCATION = os.environ.get("ROUX_DEFAULT_LOCATION", "")
 
-# On Render, seed data can be injected via secret files at /etc/secrets/.
-# Copy them into DATA_DIR on first run if the database doesn't exist yet.
-SECRETS_DIR = Path("/etc/secrets")
-if SECRETS_DIR.exists() and not PLACES_DB.exists():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    for fname in ("places.json", "taste-profile.md"):
-        src = SECRETS_DIR / fname
-        if src.exists():
-            (DATA_DIR / fname).write_bytes(src.read_bytes())
-            logger.info(f"Loaded seed data from {src}")
 
 # ---------------------------------------------------------------------------
-# Data layer
+# User identity
 # ---------------------------------------------------------------------------
 
 
-def ensure_data_dir():
-    """Create data directory if it doesn't exist."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+def get_current_user_id() -> str:
+    """Extract a stable user ID from the current auth context."""
+    try:
+        token = get_access_token()
+        if token is not None:
+            return db.get_or_create_user(token.client_id)
+    except Exception:
+        pass
+    return "local"
 
 
-def load_places() -> list[dict]:
-    """Load places from the local JSON database."""
-    if not PLACES_DB.exists():
-        return []
-    with open(PLACES_DB) as f:
-        return json.load(f)
-
-
-def save_places(places: list[dict]):
-    """Save places to the local JSON database."""
-    ensure_data_dir()
-    with open(PLACES_DB, "w") as f:
-        json.dump(places, f, indent=2)
+def load_places(user_id: str | None = None) -> list[dict]:
+    """Load places for a user from Supabase. Falls back to 'local' user."""
+    uid = user_id or get_current_user_id()
+    return db.load_user_places(uid)
 
 
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -387,53 +372,74 @@ async def import_places(csv_content: str, list_name: str = "default") -> str:
     """Import saved places from a Google Takeout CSV file.
 
     Users export their Google Maps saved places via Google Takeout,
-    which produces CSV files. Paste the contents of a CSV file here.
+    which produces CSV files. They can paste the contents or attach the file.
+
+    On re-import, Roux diffs the data: adds new places, updates changed notes,
+    and flags removed places.
 
     Args:
         csv_content: The full text content of a Google Takeout saved places CSV file.
         list_name: A label for this list (e.g. 'Screenshots', 'Want to go'). Defaults to 'default'.
     """
-    new_places = parse_takeout_csv(csv_content)
-    if not new_places:
+    user_id = get_current_user_id()
+
+    incoming = parse_takeout_csv(csv_content)
+    if not incoming:
         return "No places found in the CSV. Make sure it's a Google Takeout saved places export."
 
-    # Tag each place with the list name
-    for p in new_places:
+    for p in incoming:
         p["list"] = list_name
 
-    # Load existing and merge (avoid duplicates by name+url)
-    existing = load_places()
-    existing_keys = {(p["name"], p.get("url", "")) for p in existing}
+    # Load existing places for this user and list
+    existing = db.load_user_places(user_id, list_name=list_name)
+    existing_by_key = {(p["name"], p.get("url", "")): p for p in existing}
+    incoming_by_key = {(p["name"], p.get("url", "")): p for p in incoming}
 
-    added = 0
-    for p in new_places:
-        if (p["name"], p.get("url", "")) not in existing_keys:
-            existing.append(p)
-            existing_keys.add((p["name"], p.get("url", "")))
-            added += 1
+    # Compute diffs
+    added, updated, removed = [], [], []
 
-    save_places(existing)
+    for key, p in incoming_by_key.items():
+        if key not in existing_by_key:
+            added.append(p)
+        else:
+            old = existing_by_key[key]
+            if p.get("note") != old.get("note") or p.get("comment") != old.get("comment"):
+                updated.append({"id": old["id"], "note": p.get("note", ""), "comment": p.get("comment", "")})
 
-    # Try to enrich new places with Google Places API
-    enriched_count = 0
-    if GOOGLE_PLACES_API_KEY:
-        all_places = load_places()
-        for i, p in enumerate(all_places):
-            if not p.get("enriched") and p["name"]:
-                all_places[i] = await enrich_place(p)
-                if all_places[i].get("enriched"):
-                    enriched_count += 1
-        save_places(all_places)
+    for key, p in existing_by_key.items():
+        if key not in incoming_by_key:
+            removed.append(p)
 
-    result = f"Imported {added} new places from '{list_name}' list."
-    if enriched_count:
-        result += f" Enriched {enriched_count} places with Google Places data (addresses, coordinates, ratings)."
-    if not GOOGLE_PLACES_API_KEY:
-        result += " Note: Set GOOGLE_PLACES_API_KEY to enable automatic enrichment with addresses, hours, and ratings."
+    # Apply additions
+    if added:
+        # Enrich with Google Places API before saving
+        if GOOGLE_PLACES_API_KEY:
+            for i, p in enumerate(added):
+                if not p.get("enriched") and p["name"]:
+                    added[i] = await enrich_place(p)
+        db.upsert_user_places(user_id, added)
 
-    total = len(load_places())
-    result += f" Total places in database: {total}."
-    return result
+    # Apply note updates
+    for u in updated:
+        db.update_user_place(u["id"], {"note": u["note"], "comment": u["comment"]})
+
+    # Build report
+    lines = [f"**Import sync for '{list_name}':**"]
+    if added:
+        lines.append(f"  Added: {len(added)} new places")
+    if updated:
+        lines.append(f"  Updated: {len(updated)} places (notes changed)")
+    if removed:
+        names = ", ".join(p["name"] for p in removed[:5])
+        more = f" and {len(removed) - 5} more" if len(removed) > 5 else ""
+        lines.append(f"  No longer in export: {len(removed)} places ({names}{more})")
+        lines.append("  These weren't deleted — they may be in a different Google Maps list. Say 'remove them' if you want to clean up.")
+    if not added and not updated and not removed:
+        lines.append("  Everything is up to date — no changes detected.")
+
+    total = len(db.load_user_places(user_id))
+    lines.append(f"  Total places: {total}")
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -461,7 +467,8 @@ async def search_my_places(
         list_name: Filter to a specific import list (e.g. 'Screenshots', 'Want to go').
         limit: Maximum number of results to return (default 50).
     """
-    places = load_places()
+    user_id = get_current_user_id()
+    places = load_places(user_id)
     if not places:
         return "No places in your database yet. Use import_places to load your Google Takeout export."
 
@@ -565,7 +572,8 @@ async def get_place_info(place_name: str) -> str:
     Args:
         place_name: The name of the place to look up (e.g. "Joe's Pizza", "Blue Bottle Coffee Shibuya").
     """
-    places = load_places()
+    user_id = get_current_user_id()
+    places = load_places(user_id)
     saved = None
     for p in places:
         if place_name.lower() in p.get("name", "").lower():
@@ -671,7 +679,8 @@ async def discover_places(
 
     saved_names = set()
     if include_saved:
-        saved_names = {p["name"].lower() for p in load_places()}
+        user_id = get_current_user_id()
+        saved_names = {p["name"].lower() for p in load_places(user_id)}
 
     lines = [f"Found {len(results)} place(s) for '{query}' near {location}:\n"]
     for r in results[:10]:
@@ -702,19 +711,19 @@ async def add_note(place_name: str, note: str) -> str:
         place_name: The name of the saved place to annotate.
         note: The note to add (replaces any existing note).
     """
-    places = load_places()
+    user_id = get_current_user_id()
+    places = load_places(user_id)
     matched = None
-    for i, p in enumerate(places):
+    for p in places:
         if place_name.lower() in p.get("name", "").lower():
-            matched = i
+            matched = p
             break
 
     if matched is None:
         return f"No saved place matching '{place_name}'. Use search_my_places to find the exact name."
 
-    places[matched]["note"] = note
-    save_places(places)
-    return f"Updated note for **{places[matched]['name']}**: \"{note}\""
+    db.update_user_place(matched["id"], {"note": note})
+    return f"Updated note for **{matched['name']}**: \"{note}\""
 
 
 @mcp.tool()
@@ -724,7 +733,8 @@ async def my_places_stats() -> str:
     Shows total count, breakdown by list, top cuisines/types,
     and cities. Useful for understanding your taste profile.
     """
-    places = load_places()
+    user_id = get_current_user_id()
+    places = load_places(user_id)
     if not places:
         return "No places in your database yet. Use import_places to get started."
 
@@ -786,9 +796,11 @@ async def get_taste_profile() -> str:
     Read this before making recommendations to personalize your suggestions.
     If no profile exists yet, suggest building one based on their saved places.
     """
-    if not TASTE_PROFILE.exists():
+    user_id = get_current_user_id()
+    profile = db.get_user_taste_profile(user_id)
+    if not profile:
         return "No taste profile yet. You can start one by telling me about your preferences, or I can analyze your saved places to generate an initial profile. Just say 'build my taste profile'."
-    return TASTE_PROFILE.read_text()
+    return profile
 
 
 @mcp.tool()
@@ -802,7 +814,8 @@ async def enrich_place_expert(place_name: str) -> str:
     Args:
         place_name: Name of the saved place to enrich (e.g. "Peter Luger", "Don Angie").
     """
-    places = load_places()
+    user_id = get_current_user_id()
+    places = load_places(user_id)
     matched = next((p for p in places if place_name.lower() in p.get("name", "").lower()), None)
     if not matched:
         return f"No saved place matching '{place_name}'. Use search_my_places to find the exact name."
@@ -834,8 +847,8 @@ async def update_taste_profile(updates: str) -> str:
     Args:
         updates: The complete updated taste profile content (markdown). This replaces the existing profile, so include all existing content plus your changes.
     """
-    ensure_data_dir()
-    TASTE_PROFILE.write_text(updates)
+    user_id = get_current_user_id()
+    db.upsert_user_taste_profile(user_id, updates)
     return "Taste profile updated."
 
 
