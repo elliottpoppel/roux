@@ -100,10 +100,13 @@ def get_current_user_id() -> str:
     """Extract a stable user ID from the current auth context."""
     try:
         token = get_access_token()
+        logger.info(f"Auth token: {token}")
         if token is not None:
+            logger.info(f"Client ID: {token.client_id}")
             return db.get_or_create_user(token.client_id)
-    except Exception:
-        pass
+        logger.info("No auth token — using local fallback")
+    except Exception as e:
+        logger.error(f"Auth error: {e}")
     return "local"
 
 
