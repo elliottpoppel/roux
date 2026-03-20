@@ -47,8 +47,10 @@ On first message in a conversation, greet the user by first name and introduce \
 yourself: "Hey [name] — **🦘 Roux** here." After that, only reference Roux by \
 name when it comes up naturally.
 
-If the user has no default location set yet, ask where they're based so you \
-can set it with set_default_location. This only needs to happen once.
+If the user has no saved locations, call get_my_locations which will show \
+them onboarding instructions for sharing their places. When a user shares \
+a location naturally (e.g. "I live in the West Village"), save it with \
+save_location without asking for confirmation.
 
 **How to respond:**
 - Voice: Direct, knowledgeable friend. Not a food critic. No "elevated" or "curated."
@@ -557,11 +559,20 @@ async def search_my_places(
     if not places:
         return "No places in your database yet. Use import_places to load your Google Takeout export."
 
-    # Resolve 'near' to coordinates — fall back to user's default location
+    # Resolve 'near' — check saved locations, then fall back to 'home'
     near_coords = None
     effective_near = near
-    if not effective_near:
-        effective_near = db.get_user_default_location(user_id) or DEFAULT_LOCATION
+    user_locations = db.get_user_locations(user_id)
+
+    if effective_near:
+        # Check if it matches a saved location label (e.g. "work", "brother's")
+        near_lower = effective_near.lower().strip().rstrip("'s")
+        if near_lower in user_locations:
+            effective_near = user_locations[near_lower]
+    else:
+        # No location specified — default to home
+        effective_near = user_locations.get("home", DEFAULT_LOCATION)
+
     if effective_near:
         near_coords = await geocode_location(effective_near)
 
@@ -918,19 +929,53 @@ async def enrich_place_expert(place_name: str) -> str:
 
 
 @mcp.tool()
-async def set_default_location(location: str) -> str:
-    """Set the user's default/home location for 'near me' queries.
+async def save_location(label: str, location: str) -> str:
+    """Save a named location so the user can reference it naturally.
 
-    Call this when the user shares where they live or their home base.
-    This location is used as the default for all searches when no
-    specific location is mentioned.
+    Call this when the user shares where they live, work, or any place
+    they want to reference later. 'home' is used as the default for
+    'near me' queries.
+
+    Examples:
+        save_location("home", "2 Cornelia St, New York, NY")
+        save_location("work", "near Astor Place, NYC")
+        save_location("brother", "Fort Greene, Brooklyn")
+        save_location("parents", "Saratoga Springs, NY")
 
     Args:
-        location: The user's home location (e.g. 'West Village, NYC', '123 Main St, Brooklyn, NY').
+        label: A short name for this location (e.g. 'home', 'work', 'brother', 'hotel').
+        location: The address, neighborhood, or description of the location.
     """
     user_id = get_current_user_id()
-    db.set_user_default_location(user_id, location)
-    return f"Default location set to: {location}. All 'near me' queries will use this unless you specify a different location."
+    db.set_user_locations(user_id, {label.lower().strip(): location})
+    all_locations = db.get_user_locations(user_id)
+    saved_list = ", ".join(f"**{k}**: {v}" for k, v in all_locations.items())
+    return f"Saved! Your locations: {saved_list}"
+
+
+@mcp.tool()
+async def get_my_locations() -> str:
+    """Get the user's saved locations.
+
+    Returns all named locations the user has saved (home, work, etc.).
+    If none are set, provides onboarding instructions.
+    """
+    user_id = get_current_user_id()
+    locations = db.get_user_locations(user_id)
+    if not locations:
+        return (
+            "You don't have any locations saved yet. Share your places so you can "
+            "reference them naturally anytime — like 'near home' or 'by my office.'\n\n"
+            "You can share things like your home address, what neighborhood your "
+            "office is in, your go-to hotels when traveling for work, your vacation "
+            "home, or where friends and family live. Anything you might want to "
+            "reference when looking for a place to eat.\n\n"
+            "Start with your home address and add anything else whenever it comes up."
+        )
+    lines = ["Your saved locations:"]
+    for label, loc in locations.items():
+        lines.append(f"  **{label}**: {loc}")
+    return "\n".join(lines)
 
 
 @mcp.tool()
