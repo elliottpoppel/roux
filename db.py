@@ -13,6 +13,7 @@ from supabase import create_client, Client
 logger = logging.getLogger("roux.db")
 
 _client: Client | None = None
+_cache: dict[str, Any] = {}  # In-memory cache for user data
 
 
 def get_client() -> Client | None:
@@ -35,6 +36,10 @@ def get_client() -> Client | None:
 
 def get_or_create_user(client_id: str) -> str:
     """Return a stable user_id for the given OAuth client_id, creating if needed."""
+    cache_key = f"user:{client_id}"
+    if cache_key in _cache:
+        return _cache[cache_key]
+
     client = get_client()
     if not client:
         return "local"
@@ -42,30 +47,34 @@ def get_or_create_user(client_id: str) -> str:
     # Check if this client_id is already mapped
     result = client.table("user_clients").select("user_id").eq("client_id", client_id).execute()
     if result.data:
-        return result.data[0]["user_id"]
+        uid = result.data[0]["user_id"]
+        _cache[cache_key] = uid
+        return uid
 
     # Unknown client_id — check if there's only one user (single-tenant mode)
     all_users = client.table("users").select("id").execute()
     if all_users.data and len(all_users.data) == 1:
         # Single user — auto-link this client_id to them
-        user_id = all_users.data[0]["id"]
-        logger.info(f"Auto-linking client {client_id} to sole user {user_id}")
+        uid = all_users.data[0]["id"]
+        logger.info(f"Auto-linking client {client_id} to sole user {uid}")
         try:
             client.table("user_clients").insert({
-                "user_id": user_id,
+                "user_id": uid,
                 "client_id": client_id,
             }).execute()
         except Exception as e:
             logger.warning(f"Failed to save client mapping: {e}")
-        return user_id
+        _cache[cache_key] = uid
+        return uid
 
     # Multi-user: create a new user
     try:
         user = client.table("users").insert({"display_name": None}).execute()
-        user_id = user.data[0]["id"]
-        client.table("user_clients").insert({"user_id": user_id, "client_id": client_id}).execute()
-        logger.info(f"Created new user {user_id} for client {client_id}")
-        return user_id
+        uid = user.data[0]["id"]
+        client.table("user_clients").insert({"user_id": uid, "client_id": client_id}).execute()
+        logger.info(f"Created new user {uid} for client {client_id}")
+        _cache[cache_key] = uid
+        return uid
     except Exception as e:
         logger.error(f"get_or_create_user failed: {e}")
         return "local"
@@ -77,24 +86,41 @@ def get_or_create_user(client_id: str) -> str:
 
 
 def load_user_places(user_id: str, list_name: str | None = None) -> list[dict]:
-    """Load all saved places for a user, optionally filtered by list."""
-    db = get_client()
-    if not db:
+    """Load all saved places for a user, optionally filtered by list.
+    Cached in memory after first load for fast subsequent queries."""
+    cache_key = f"places:{user_id}"
+    if cache_key in _cache and not list_name:
+        return _cache[cache_key]
+
+    client = get_client()
+    if not client:
         return []
-    q = db.table("user_places").select("*").eq("user_id", user_id)
+    q = client.table("user_places").select("*").eq("user_id", user_id)
     if list_name:
         q = q.eq("list", list_name)
-    return q.execute().data or []
+    places = q.execute().data or []
+
+    if not list_name:
+        _cache[cache_key] = places
+    return places
+
+
+def invalidate_user_cache(user_id: str):
+    """Clear cached data for a user (call after imports/updates)."""
+    keys_to_remove = [k for k in _cache if k.endswith(f":{user_id}")]
+    for k in keys_to_remove:
+        del _cache[k]
 
 
 def upsert_user_places(user_id: str, places: list[dict]):
     """Insert or update places for a user. Dedup by (user_id, name, url)."""
-    db = get_client()
-    if not db:
+    client = get_client()
+    if not client:
         return
     for p in places:
         p["user_id"] = user_id
-    db.table("user_places").upsert(places, on_conflict="user_id,name,url").execute()
+    client.table("user_places").upsert(places, on_conflict="user_id,name,url").execute()
+    invalidate_user_cache(user_id)
 
 
 def update_user_place(place_id: str, updates: dict):
