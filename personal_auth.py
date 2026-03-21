@@ -82,7 +82,7 @@ class PersonalAuthProvider(InMemoryOAuthProvider):
                 Defaults to ["claude.ai", "claude.com", "localhost"]. Set to None
                 to allow all domains (not recommended for public servers).
             access_token_expiry_seconds: How long access tokens last. Default 30 days.
-            state_dir: Directory for persisting OAuth state. Default ".oauth-state".
+            state_dir: Deprecated — OAuth state is now stored in Supabase.
         """
         super().__init__(
             base_url=base_url,
@@ -94,21 +94,30 @@ class PersonalAuthProvider(InMemoryOAuthProvider):
             "claude.ai", "claude.com", "localhost"
         ]
         self.access_token_expiry_seconds = access_token_expiry_seconds
-        self._state_dir = Path(state_dir or DEFAULT_STATE_DIR)
-        self._state_dir.mkdir(parents=True, exist_ok=True)
         self._load_state()
 
-    # --- State persistence ---
+    # --- State persistence (Supabase) ---
 
-    def _state_file(self) -> Path:
-        return self._state_dir / "oauth_tokens.json"
+    def _get_supabase(self):
+        """Get Supabase client for OAuth state persistence."""
+        import os
+        url = os.environ.get("SUPABASE_URL")
+        key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        if url and key:
+            from supabase import create_client
+            return create_client(url, key)
+        return None
 
     def _load_state(self):
-        f = self._state_file()
-        if not f.exists():
-            return
         try:
-            data = json.loads(f.read_text())
+            client = self._get_supabase()
+            if not client:
+                logger.warning("No Supabase connection — OAuth state not loaded")
+                return
+            result = client.table("oauth_state").select("state").eq("id", "default").execute()
+            if not result.data or not result.data[0].get("state"):
+                return
+            data = result.data[0]["state"]
             for k, v in data.get("clients", {}).items():
                 self.clients[k] = OAuthClientInformationFull(**v)
             for k, v in data.get("access_tokens", {}).items():
@@ -118,11 +127,11 @@ class PersonalAuthProvider(InMemoryOAuthProvider):
             self._access_to_refresh_map = data.get("a2r", {})
             self._refresh_to_access_map = data.get("r2a", {})
             logger.info(
-                f"Loaded OAuth state: {len(self.clients)} clients, "
+                f"Loaded OAuth state from Supabase: {len(self.clients)} clients, "
                 f"{len(self.access_tokens)} access tokens"
             )
         except Exception as e:
-            logger.warning(f"Failed to load OAuth state from {f}: {e}")
+            logger.warning(f"Failed to load OAuth state: {e}")
 
     def _save_state(self):
         def serialize(obj):
@@ -140,7 +149,15 @@ class PersonalAuthProvider(InMemoryOAuthProvider):
             "a2r": self._access_to_refresh_map,
             "r2a": self._refresh_to_access_map,
         }
-        self._state_file().write_text(json.dumps(data, indent=2))
+        try:
+            client = self._get_supabase()
+            if client:
+                client.table("oauth_state").upsert({
+                    "id": "default",
+                    "state": data,
+                }).execute()
+        except Exception as e:
+            logger.error(f"Failed to save OAuth state: {e}")
 
     # --- Authorization gate ---
 
