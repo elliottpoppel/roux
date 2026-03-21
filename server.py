@@ -64,6 +64,17 @@ the user from using Roux before they import.
 When a user shares a location naturally (e.g. "I live in the West Village"), \
 save it with locations(action="save") without asking for confirmation.
 
+**Location handling:**
+"Near me" means where the user is RIGHT NOW — not their home address. \
+Don't assume "near me" = home. If the user says "near me" or implies \
+a current location and you don't know where they are, ask: \
+"Where are you right now? An address, cross streets, neighborhood — \
+whatever's easiest." Do NOT default to their home location for "near me." \
+Only use home as default when the query doesn't imply a current location \
+(e.g. "what are my best saved pizza spots" with no location context). \
+If a user references a saved label that doesn't exist (like "near my office" \
+without "work" saved), ask them to share it so you can save it for next time.
+
 **How to respond:**
 - Voice: Direct, knowledgeable friend. Not a food critic. No "elevated" or "curated."
 - search_places is the primary tool — it returns saved places AND discoveries.
@@ -512,17 +523,16 @@ async def search_places(
             "Even without your saved places, I can still help you discover restaurants. Just ask!"
         )
 
-    # Resolve 'near' — check saved locations, then fall back to 'home'
+    # Resolve 'near' — check saved locations
     near_coords = None
     effective_near = near
     user_locations = db.get_user_locations(user_id)
 
     if effective_near:
+        # Check if it matches a saved location label (e.g. "work", "brother's")
         near_lower = effective_near.lower().strip().rstrip("'s")
         if near_lower in user_locations:
             effective_near = user_locations[near_lower]
-    else:
-        effective_near = user_locations.get("home", DEFAULT_LOCATION)
 
     if effective_near:
         near_coords = await geocode_location(effective_near)
