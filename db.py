@@ -319,6 +319,64 @@ def upsert_dish(dish: dict):
         client.table("place_dishes").insert(dish).execute()
 
 
+def batch_upsert_dishes(expert_place_id: str, dishes: list[dict]):
+    """Dedup and write dishes in a single batch — much faster than per-dish queries.
+
+    Loads existing dishes once, deduplicates in memory using normalized names,
+    then writes only new/upgraded dishes in one pass.
+    """
+    client = get_client()
+    if not client or not dishes:
+        return
+
+    # Load existing dishes for this place (one query)
+    existing_result = (
+        client.table("place_dishes")
+        .select("id, dish_name, source_id, sources(quality_rank)")
+        .eq("expert_place_id", expert_place_id)
+        .execute()
+    )
+    existing_by_norm = {}
+    for e in (existing_result.data or []):
+        norm = _normalize_dish_name(e["dish_name"])
+        existing_by_norm[norm] = e
+
+    # Dedup new dishes in memory
+    to_insert = []
+    to_update = []
+    seen_norms = set()
+
+    for d in dishes:
+        norm = _normalize_dish_name(d["dish_name"])
+        if norm in seen_norms:
+            continue  # Skip duplicates within this batch
+        seen_norms.add(norm)
+
+        if norm in existing_by_norm:
+            # Only upgrade if new source has better rank
+            old_rank = existing_by_norm[norm].get("sources", {}).get("quality_rank", 999)
+            new_rank = _get_source_rank(d["source_id"])
+            if new_rank < old_rank:
+                to_update.append({
+                    "id": existing_by_norm[norm]["id"],
+                    "dish_name": d["dish_name"],
+                    "source_id": d["source_id"],
+                    "review_id": d["review_id"],
+                    "sentiment": d["sentiment"],
+                    "note": d.get("note"),
+                })
+        else:
+            to_insert.append(d)
+            existing_by_norm[norm] = d  # Prevent duplicates within batch
+
+    # Batch write
+    if to_insert:
+        client.table("place_dishes").insert(to_insert).execute()
+    for u in to_update:
+        row_id = u.pop("id")
+        client.table("place_dishes").update(u).eq("id", row_id).execute()
+
+
 def _get_source_rank(source_id: str) -> int:
     """Get quality rank for a source. Lower = better."""
     client = get_client()
