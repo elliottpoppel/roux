@@ -595,20 +595,25 @@ async def search_places(
             saved_names.add(p.get("name", "").lower())
             lines.append(format_place_card(p, r.get("distance"), saved=True))
 
-    # Auto-discover new places
-    if effective_near and GOOGLE_PLACES_API_KEY:
+    # Auto-discover new places — use effective_near, or infer from saved results
+    discovery_coords = near_coords
+    if not discovery_coords and results:
+        # Infer location from the closest saved results
+        lats = [r["place"]["lat"] for r in results[:5] if r["place"].get("lat")]
+        lngs = [r["place"]["lng"] for r in results[:5] if r["place"].get("lng")]
+        if lats and lngs:
+            discovery_coords = {"lat": sum(lats) / len(lats), "lng": sum(lngs) / len(lngs)}
+    if discovery_coords and GOOGLE_PLACES_API_KEY:
         search_query = query or "restaurant"
-        geo = near_coords or await geocode_location(effective_near)
-        if geo:
-            saved_names_lower = {p.get("name", "").lower() for p in places}
-            discovery = await search_nearby_api(geo["lat"], geo["lng"], query=search_query, radius=3000)
-            if not discovery:
-                discovery = await text_search_api(f"{search_query} near {effective_near}")
-            new_places = [r for r in discovery if r.get("name", "").lower() not in saved_names_lower][:5]
-            if new_places:
-                lines.append("\n**You might also like:**\n")
-                for r in new_places:
-                    lines.append(format_discovery_card(r))
+        saved_names_lower = {p.get("name", "").lower() for p in places}
+        discovery = await search_nearby_api(discovery_coords["lat"], discovery_coords["lng"], query=search_query, radius=3000)
+        if not discovery and effective_near:
+            discovery = await text_search_api(f"{search_query} near {effective_near}")
+        new_places = [r for r in (discovery or []) if r.get("name", "").lower() not in saved_names_lower][:5]
+        if new_places:
+            lines.append("\n**You might also like:**\n")
+            for r in new_places:
+                lines.append(format_discovery_card(r))
 
     return "\n\n".join(lines)
 
