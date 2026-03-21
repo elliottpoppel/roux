@@ -77,10 +77,14 @@ without "work" saved), ask them to share it so you can save it for next time.
 
 **How to respond:**
 - Voice: Direct, knowledgeable friend. Not a food critic. No "elevated" or "curated."
-- search_places is the primary tool — it returns saved places AND discoveries.
-- ALWAYS include both saved places and new discoveries unless the user \
-explicitly says "only saved", "just saved", "only my places", or similar. \
-Default: 3 saved places + 2 new recommendations. Saved places come first.
+- search_places is the primary tool. It returns pre-curated results — already \
+ranked by relevance, capped, and filtered. Present ALL places it returns. \
+Don't drop any. Don't add places the tool didn't return.
+- The tool handles curation. Your job is presentation: voice, brief commentary \
+(1-2 sentences per place), and preserving the card structure. Don't rewrite \
+cards as prose paragraphs.
+- Always present both saved places AND discoveries ("You might also like"). \
+Never silently drop the discovery section.
 - Every recommendation should name specific dishes.
 - User notes are first-class — interweave and enrich them with expert data, \
 don't just quote verbatim.
@@ -363,8 +367,17 @@ async def text_search_api(query: str, location: str = "") -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def format_expert_knowledge(google_place_id: str) -> str:
-    """Return a formatted string of expert knowledge for a place, or empty string."""
+def format_expert_knowledge(google_place_id: str, query: str = "", detailed: bool = False) -> str:
+    """Return formatted expert knowledge, filtered by query relevance.
+
+    Args:
+        google_place_id: The Google Place ID to look up.
+        query: If set, prioritize dishes matching this query.
+        detailed: If True (place_details), show full treatment — more dishes,
+                  expert take, skip list, guide mentions.
+                  If False (search_places list), show lean output — fewer dishes,
+                  no prose, no guides.
+    """
     try:
         knowledge = db.get_expert_knowledge(google_place_id)
     except Exception:
@@ -375,14 +388,23 @@ def format_expert_knowledge(google_place_id: str) -> str:
 
     lines = []
 
-    # Dishes
+    # Dishes — filter by query relevance, cap by context
     dishes = knowledge.get("dishes", [])
     must_order = [d for d in dishes if d["sentiment"] in ("must_order", "recommended")]
     skip = [d for d in dishes if d["sentiment"] in ("skip", "overhyped")]
 
+    # When there's a query, lead with relevant dishes
+    if query and must_order:
+        query_lower = query.lower()
+        relevant = [d for d in must_order if query_lower in d["dish_name"].lower()]
+        other = [d for d in must_order if query_lower not in d["dish_name"].lower()]
+        must_order = relevant + other
+
+    max_dishes = 6 if detailed else 3
+
     if must_order:
         dish_strs = []
-        for d in must_order[:6]:
+        for d in must_order[:max_dishes]:
             s = d["dish_name"]
             if d.get("note"):
                 s += f" ({d['note']})"
@@ -392,25 +414,25 @@ def format_expert_knowledge(google_place_id: str) -> str:
             dish_strs.append(s)
         lines.append(f"→ Order: {', '.join(dish_strs)}")
 
-    if skip:
+    if skip and detailed:
         skip_strs = [d["dish_name"] for d in skip[:3]]
         lines.append(f"→ Skip: {', '.join(skip_strs)}")
 
-    # Top review summary (highest quality source)
-    reviews = knowledge.get("reviews", [])
-    if reviews:
-        top = reviews[0]
-        source_name = top.get("sources", {}).get("name", "")
-        summary = top.get("summary", "")
-        if summary:
-            lines.append(f"→ Expert take ({source_name}): {summary}")
+    # Expert take and guide mentions — only in detailed mode
+    if detailed:
+        reviews = knowledge.get("reviews", [])
+        if reviews:
+            top = reviews[0]
+            source_name = top.get("sources", {}).get("name", "")
+            summary = top.get("summary", "")
+            if summary:
+                lines.append(f"→ Expert take ({source_name}): {summary}")
 
-    # Guide mentions
-    mentions = knowledge.get("guide_mentions", [])
-    if mentions:
-        themes = [m.get("guides", {}).get("theme", "") for m in mentions[:3] if m.get("guides", {}).get("theme")]
-        if themes:
-            lines.append(f"→ Featured in: {', '.join(themes)}")
+        mentions = knowledge.get("guide_mentions", [])
+        if mentions:
+            themes = [m.get("guides", {}).get("theme", "") for m in mentions[:3] if m.get("guides", {}).get("theme")]
+            if themes:
+                lines.append(f"→ Featured in: {', '.join(themes)}")
 
     return "\n".join(lines)
 
@@ -430,7 +452,7 @@ def _extract_neighborhood(address: str) -> str:
     return parts[0] if parts else ""
 
 
-def format_place_card(p: dict, distance: float | None = None, saved: bool = False) -> str:
+def format_place_card(p: dict, distance: float | None = None, saved: bool = False, query: str = "") -> str:
     """Format a place as a consistent card."""
     # Header line: name · rating · price · location
     parts = [f"**{p.get('name', 'Unknown')}**"]
@@ -453,7 +475,7 @@ def format_place_card(p: dict, distance: float | None = None, saved: bool = Fals
     if p.get("note"):
         line += f"\nYour note: {p['note']}"
     if p.get("place_id"):
-        expert = format_expert_knowledge(p["place_id"])
+        expert = format_expert_knowledge(p["place_id"], query=query)
         if expert:
             line += f"\n{expert}"
 
@@ -493,7 +515,7 @@ async def search_places(
     near: str = "",
     max_distance_miles: float = 0,
     list_name: str = "",
-    limit: int = 50,
+    limit: int = 10,
 ) -> str:
     """Search saved places and discover new ones — all in one call.
 
@@ -508,7 +530,7 @@ async def search_places(
         near: A location or saved location label to search near (e.g. 'Times Square', 'home', 'work', 'brother').
         max_distance_miles: Only show places within this distance. 0 means no limit.
         list_name: Filter to a specific import list (e.g. 'Screenshots', 'Want to go').
-        limit: Maximum number of results to return (default 50).
+        limit: Maximum saved results to return (default 10, auto-capped to 5 when query is set).
     """
     user_id = get_current_user_id()
     places = load_places(user_id)
@@ -585,21 +607,19 @@ async def search_places(
     else:
         results.sort(key=lambda x: (-x.get("relevance", 0), x["place"].get("name", "")))
 
-    results = results[:limit]
+    # Smart cap: tighter with a query (curated), looser when browsing
+    saved_cap = min(limit, 5 if query else 10)
+    results = results[:saved_cap]
 
     if not results:
         lines = ["No saved places match your search."]
     else:
-        # Check how many places have expert data
-        enriched_count = sum(1 for r in results if r["place"].get("place_id") and format_expert_knowledge(r["place"]["place_id"]))
         lines = [f"**From your saved places** ({len(results)} match):\n"]
-        if enriched_count == 0 and len(results) > 0:
-            lines.append("_Note: Expert dish recommendations are still being processed for your places. Results will get richer over time._\n")
         saved_names = set()
         for r in results:
             p = r["place"]
             saved_names.add(p.get("name", "").lower())
-            lines.append(format_place_card(p, r.get("distance"), saved=True))
+            lines.append(format_place_card(p, r.get("distance"), saved=True, query=query))
 
     # Auto-discover new places — use effective_near, or infer from saved results
     discovery_coords = near_coords
@@ -615,7 +635,7 @@ async def search_places(
         discovery = await search_nearby_api(discovery_coords["lat"], discovery_coords["lng"], query=search_query, radius=3000)
         if not discovery and effective_near:
             discovery = await text_search_api(f"{search_query} near {effective_near}")
-        new_places = [r for r in (discovery or []) if r.get("name", "").lower() not in saved_names_lower][:5]
+        new_places = [r for r in (discovery or []) if r.get("name", "").lower() not in saved_names_lower][:3]
         if new_places:
             lines.append("\n**You might also like:**\n")
             for r in new_places:
@@ -698,12 +718,12 @@ async def place_details(place_name: str) -> str:
                 lines.append(f"  {day}")
 
     # Expert knowledge — auto-enrich if missing
-    expert = format_expert_knowledge(place_id)
+    expert = format_expert_knowledge(place_id, detailed=True)
     if not expert and saved and saved.get("place_id"):
         try:
             from enrichment import enrich_one_place
             await enrich_one_place(saved)
-            expert = format_expert_knowledge(place_id)
+            expert = format_expert_knowledge(place_id, detailed=True)
         except Exception:
             pass
     if expert:
