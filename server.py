@@ -553,11 +553,19 @@ async def search_places(
         if p.get("business_status") == "CLOSED_PERMANENTLY":
             continue
 
+        relevance = 0  # Higher = more relevant to this query
         if query_lower:
-            searchable = f"{p.get('name', '')} {p.get('note', '')} {p.get('comment', '')} {' '.join(p.get('types', []))}".lower()
-            name_match = query_lower in searchable
-            expert_match = p.get("place_id") in expert_match_ids
-            if not name_match and not expert_match:
+            # Check name and user notes (strongest signal)
+            name_and_notes = f"{p.get('name', '')} {p.get('note', '')} {p.get('comment', '')}".lower()
+            type_str = ' '.join(p.get('types', [])).lower()
+
+            if query_lower in name_and_notes:
+                relevance = 3  # User's own data — highest signal
+            elif query_lower in type_str:
+                relevance = 2  # Google place type match
+            elif p.get("place_id") in expert_match_ids:
+                relevance = 1  # Expert dish match — weakest signal
+            else:
                 continue
 
         if list_name and p.get("list", "").lower() != list_name.lower():
@@ -569,15 +577,13 @@ async def search_places(
             if max_distance_miles > 0 and distance > max_distance_miles:
                 continue
 
-        results.append({"place": p, "distance": distance})
+        results.append({"place": p, "distance": distance, "relevance": relevance})
 
-    # Sort by distance if available, otherwise alphabetically
+    # Sort by relevance first, then distance
     if near_coords:
-        with_dist = sorted([r for r in results if r["distance"] is not None], key=lambda x: x["distance"])
-        without_dist = [r for r in results if r["distance"] is None]
-        results = with_dist + without_dist
+        results.sort(key=lambda x: (-x.get("relevance", 0), x["distance"] if x["distance"] is not None else 999))
     else:
-        results.sort(key=lambda x: x["place"].get("name", ""))
+        results.sort(key=lambda x: (-x.get("relevance", 0), x["place"].get("name", "")))
 
     results = results[:limit]
 

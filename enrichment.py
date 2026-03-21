@@ -54,7 +54,10 @@ SOURCE_DOMAINS = [
 
 EXTRACTION_PROMPT = """You are extracting structured data from a restaurant review or guide.
 
-Return a JSON object with these fields:
+FIRST: Check if this article is actually about the restaurant "{name}" in {city}. If the article is about a DIFFERENT restaurant with a similar name, or about a restaurant in a different city, return: {{"wrong_match": true}}
+
+If the article IS about the right restaurant, return a JSON object with these fields:
+- "wrong_match": false
 - "summary": 2-3 sentence summary of what makes this place worth going to (or not)
 - "sentiment": "positive", "mixed", or "negative" overall sentiment
 - "dishes": list of dish objects, each with:
@@ -67,6 +70,7 @@ Return a JSON object with these fields:
 IMPORTANT: Keep the dish list tight. Only include genuinely distinct menu items. A place with 3 things on the menu should have ~3 dishes, not 10 variations.
 
 Restaurant: {name}
+City/Location: {city}
 Article title: {title}
 Article text:
 {text}
@@ -182,7 +186,7 @@ async def fetch_article(url: str) -> tuple[str, str]:
             return "", ""
 
 
-def extract_with_llm(place_name: str, title: str, text: str) -> dict | None:
+def extract_with_llm(place_name: str, title: str, text: str, city: str = "") -> dict | None:
     """Use Claude to extract structured dish/review data from article text."""
     if not ANTHROPIC_API_KEY:
         logger.warning("No ANTHROPIC_API_KEY — skipping LLM extraction")
@@ -191,7 +195,7 @@ def extract_with_llm(place_name: str, title: str, text: str) -> dict | None:
         return None
 
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    prompt = EXTRACTION_PROMPT.format(name=place_name, title=title, text=text[:6000])
+    prompt = EXTRACTION_PROMPT.format(name=place_name, city=city or "unknown", title=title, text=text[:6000])
 
     try:
         message = client.messages.create(
@@ -273,9 +277,10 @@ async def enrich_one_place(place: dict) -> bool:
 
     logger.info(f"Enriching: {name}")
 
-    # Search for reviews — one query with site: filter for approved domains
+    # Search for reviews — include city to avoid wrong-restaurant matches
     sites = " OR ".join(f"site:{d}" for d in SOURCE_DOMAINS)
-    query = f'"{name}" ({sites})'
+    location_hint = city or address.split(",")[0] if address else ""
+    query = f'"{name}" {location_hint} ({sites})'
     search_results = web_search(query, num=5)
     if search_results:
         # Filter to only approved domains, cap at 3 (diminishing returns after that)
@@ -307,8 +312,11 @@ async def enrich_one_place(place: dict) -> bool:
         if not text:
             continue
 
-        extracted = extract_with_llm(name, title, text)
+        extracted = extract_with_llm(name, title, text, city=city)
         if not extracted:
+            continue
+        if extracted.get("wrong_match"):
+            logger.info(f"  Skipping wrong match: {title[:60]}")
             continue
 
         # Store the review
