@@ -47,18 +47,19 @@ On first message in a conversation, greet the user by first name and introduce \
 yourself: "Hey [name] — **🦘 Roux** here." After that, only reference Roux by \
 name when it comes up naturally.
 
-If the user has no saved locations, call get_my_locations which will show \
+If the user has no saved locations, call locations() which will show \
 them onboarding instructions for sharing their places. When a user shares \
 a location naturally (e.g. "I live in the West Village"), save it with \
-save_location without asking for confirmation.
+locations(action="save", label="home", location="West Village, NYC") \
+without asking for confirmation.
 
 **How to respond:**
 - Voice: Direct, knowledgeable friend. Not a food critic. No "elevated" or "curated."
-- search_my_places is the primary tool — it returns saved places AND discoveries.
+- search_places is the primary tool — it returns saved places AND discoveries.
 - ALWAYS include both saved places and new discoveries unless the user \
 explicitly says "only saved", "just saved", "only my places", or similar. \
 Default: 3 saved places + 2 new recommendations. Saved places come first.
-- Every recommendation should name specific dishes. Roux is dish-first.
+- Every recommendation should name specific dishes.
 - User notes are first-class — interweave and enrich them with expert data, \
 don't just quote verbatim.
 - Notes are disputable: if a user's note conflicts with expert consensus, flag it honestly.
@@ -69,6 +70,8 @@ don't just quote verbatim.
 - Include practical details (cash only, BYOB, reservation required) only when vital.
 - Lead with recommendations, then offer to refine. Don't interrogate with questions first.
 - Never more detail than the question warrants.
+- Use place_details when the user asks about a specific place (hours, what to order, \
+deep dive) — not for listing multiple options.
 
 **Formatting — IMPORTANT:**
 - Write conversational commentary about each place, but ALWAYS follow it with \
@@ -157,7 +160,6 @@ def parse_takeout_csv(csv_content: str) -> list[dict]:
             "url": row.get("URL", "").strip(),
             "tags": [t.strip() for t in row.get("Tags", "").split(",") if t.strip()],
             "comment": row.get("Comment", "").strip(),
-            # These will be enriched later via Google Places API
             "address": "",
             "lat": None,
             "lng": None,
@@ -351,11 +353,11 @@ def format_expert_knowledge(google_place_id: str) -> str:
             if source:
                 s += f" — {source.get('name', '')}"
             dish_strs.append(s)
-        lines.append(f"  Order: {', '.join(dish_strs)}")
+        lines.append(f"→ Order: {', '.join(dish_strs)}")
 
     if skip:
         skip_strs = [d["dish_name"] for d in skip[:3]]
-        lines.append(f"  Skip: {', '.join(skip_strs)}")
+        lines.append(f"→ Skip: {', '.join(skip_strs)}")
 
     # Top review summary (highest quality source)
     reviews = knowledge.get("reviews", [])
@@ -364,16 +366,21 @@ def format_expert_knowledge(google_place_id: str) -> str:
         source_name = top.get("sources", {}).get("name", "")
         summary = top.get("summary", "")
         if summary:
-            lines.append(f"  Expert take ({source_name}): {summary}")
+            lines.append(f"→ Expert take ({source_name}): {summary}")
 
     # Guide mentions
     mentions = knowledge.get("guide_mentions", [])
     if mentions:
         themes = [m.get("guides", {}).get("theme", "") for m in mentions[:3] if m.get("guides", {}).get("theme")]
         if themes:
-            lines.append(f"  Featured in: {', '.join(themes)}")
+            lines.append(f"→ Featured in: {', '.join(themes)}")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Card formatting
+# ---------------------------------------------------------------------------
 
 
 def _extract_neighborhood(address: str) -> str:
@@ -387,13 +394,7 @@ def _extract_neighborhood(address: str) -> str:
 
 
 def format_place_card(p: dict, distance: float | None = None, saved: bool = False) -> str:
-    """Format a place as a consistent card.
-
-    **Place Name** · 4.5★ · $$ · West Village (saved)
-    Your note context enriched with expert knowledge.
-    → Order: specific dishes
-    → Practical detail if vital
-    """
+    """Format a place as a consistent card."""
     # Header line: name · rating · price · location
     parts = [f"**{p.get('name', 'Unknown')}**"]
     if p.get("rating"):
@@ -410,15 +411,10 @@ def format_place_card(p: dict, distance: float | None = None, saved: bool = Fals
         parts.append("saved")
     line = " · ".join(parts)
 
-    # Address
     if p.get("address"):
         line += f"\n{p['address']}"
-
-    # User note
     if p.get("note"):
         line += f"\nYour note: {p['note']}"
-
-    # Expert knowledge
     if p.get("place_id"):
         expert = format_expert_knowledge(p["place_id"])
         if expert:
@@ -450,106 +446,29 @@ def format_discovery_card(r: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# MCP Tools
+# MCP Tools (6 total)
 # ---------------------------------------------------------------------------
 
 
 @mcp.tool()
-async def import_places(csv_content: str, list_name: str = "default") -> str:
-    """Import saved places from a Google Takeout CSV file.
-
-    Users export their Google Maps saved places via Google Takeout,
-    which produces CSV files. They can paste the contents or attach the file.
-
-    On re-import, Roux diffs the data: adds new places, updates changed notes,
-    and flags removed places.
-
-    Args:
-        csv_content: The full text content of a Google Takeout saved places CSV file.
-        list_name: A label for this list (e.g. 'Screenshots', 'Want to go'). Defaults to 'default'.
-    """
-    user_id = get_current_user_id()
-
-    incoming = parse_takeout_csv(csv_content)
-    if not incoming:
-        return "No places found in the CSV. Make sure it's a Google Takeout saved places export."
-
-    for p in incoming:
-        p["list"] = list_name
-
-    # Load existing places for this user and list
-    existing = db.load_user_places(user_id, list_name=list_name)
-    existing_by_key = {(p["name"], p.get("url", "")): p for p in existing}
-    incoming_by_key = {(p["name"], p.get("url", "")): p for p in incoming}
-
-    # Compute diffs
-    added, updated, removed = [], [], []
-
-    for key, p in incoming_by_key.items():
-        if key not in existing_by_key:
-            added.append(p)
-        else:
-            old = existing_by_key[key]
-            if p.get("note") != old.get("note") or p.get("comment") != old.get("comment"):
-                updated.append({"id": old["id"], "note": p.get("note", ""), "comment": p.get("comment", "")})
-
-    for key, p in existing_by_key.items():
-        if key not in incoming_by_key:
-            removed.append(p)
-
-    # Apply additions
-    if added:
-        # Enrich with Google Places API before saving
-        if GOOGLE_PLACES_API_KEY:
-            for i, p in enumerate(added):
-                if not p.get("enriched") and p["name"]:
-                    added[i] = await enrich_place(p)
-        db.upsert_user_places(user_id, added)
-
-    # Apply note updates
-    for u in updated:
-        db.update_user_place(u["id"], {"note": u["note"], "comment": u["comment"]})
-
-    # Build report
-    lines = [f"**Import sync for '{list_name}':**"]
-    if added:
-        lines.append(f"  Added: {len(added)} new places")
-    if updated:
-        lines.append(f"  Updated: {len(updated)} places (notes changed)")
-    if removed:
-        names = ", ".join(p["name"] for p in removed[:5])
-        more = f" and {len(removed) - 5} more" if len(removed) > 5 else ""
-        lines.append(f"  No longer in export: {len(removed)} places ({names}{more})")
-        lines.append("  These weren't deleted — they may be in a different Google Maps list. Say 'remove them' if you want to clean up.")
-    if not added and not updated and not removed:
-        lines.append("  Everything is up to date — no changes detected.")
-
-    total = len(db.load_user_places(user_id))
-    lines.append(f"  Total places: {total}")
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def search_my_places(
+async def search_places(
     query: str = "",
     near: str = "",
     max_distance_miles: float = 0,
     list_name: str = "",
     limit: int = 50,
 ) -> str:
-    """Search the user's saved places AND discover new ones — all in one call.
+    """Search saved places and discover new ones — all in one call.
 
     This is the PRIMARY tool for any dining question. It searches saved places,
-    user notes, and expert dish data (NYT, Infatuation, Eater, etc.). When a
-    location is provided, it also automatically discovers nearby places the user
-    hasn't saved yet.
+    user notes, and expert dish data (NYT, Infatuation, Eater, etc.). It also
+    automatically discovers nearby places the user hasn't saved yet.
 
-    Returns saved places first, then new discoveries. No need to call
-    discover_places separately — this tool does both.
+    Returns saved places first, then new discoveries.
 
     Args:
         query: Search across place names, notes, types, and expert dish data (e.g. 'burger', 'pizza by the slice', 'natural wine').
-        near: A location to search near (e.g. 'Times Square', 'Shibuya', '10001').
+        near: A location or saved location label to search near (e.g. 'Times Square', 'home', 'work', 'brother').
         max_distance_miles: Only show places within this distance. 0 means no limit.
         list_name: Filter to a specific import list (e.g. 'Screenshots', 'Want to go').
         limit: Maximum number of results to return (default 50).
@@ -565,12 +484,10 @@ async def search_my_places(
     user_locations = db.get_user_locations(user_id)
 
     if effective_near:
-        # Check if it matches a saved location label (e.g. "work", "brother's")
         near_lower = effective_near.lower().strip().rstrip("'s")
         if near_lower in user_locations:
             effective_near = user_locations[near_lower]
     else:
-        # No location specified — default to home
         effective_near = user_locations.get("home", DEFAULT_LOCATION)
 
     if effective_near:
@@ -588,7 +505,6 @@ async def search_my_places(
     query_lower = query.lower()
 
     for p in places:
-        # Text search across name and notes
         if query_lower:
             searchable = f"{p.get('name', '')} {p.get('note', '')} {p.get('comment', '')} {' '.join(p.get('types', []))}".lower()
             name_match = query_lower in searchable
@@ -596,11 +512,9 @@ async def search_my_places(
             if not name_match and not expert_match:
                 continue
 
-        # List filter
         if list_name and p.get("list", "").lower() != list_name.lower():
             continue
 
-        # Distance filter
         distance = None
         if near_coords and p.get("lat") and p.get("lng"):
             distance = haversine(near_coords["lat"], near_coords["lng"], p["lat"], p["lng"])
@@ -620,32 +534,25 @@ async def search_my_places(
     results = results[:limit]
 
     if not results:
-        filters = []
-        if query:
-            filters.append(f"query='{query}'")
-        if near:
-            filters.append(f"near='{near}'")
-        if list_name:
-            filters.append(f"list='{list_name}'")
-        return f"No saved places match your search ({', '.join(filters)}). Try broadening your criteria, or use discover_places to search beyond your saved list."
+        lines = ["No saved places match your search."]
+    else:
+        lines = [f"**From your saved places** ({len(results)} match):\n"]
+        saved_names = set()
+        for r in results:
+            p = r["place"]
+            saved_names.add(p.get("name", "").lower())
+            lines.append(format_place_card(p, r.get("distance"), saved=True))
 
-    # Format saved places as cards
-    lines = [f"**From your saved places** ({len(results)} match):\n"]
-    saved_names = set()
-    for r in results:
-        p = r["place"]
-        saved_names.add(p.get("name", "").lower())
-        lines.append(format_place_card(p, r.get("distance"), saved=True))
-
-    # Auto-discover new places if a location is provided
-    if near and GOOGLE_PLACES_API_KEY:
+    # Auto-discover new places
+    if effective_near and GOOGLE_PLACES_API_KEY:
         search_query = query or "restaurant"
-        geo = near_coords or await geocode_location(near)
+        geo = near_coords or await geocode_location(effective_near)
         if geo:
+            saved_names_lower = {p.get("name", "").lower() for p in places}
             discovery = await search_nearby_api(geo["lat"], geo["lng"], query=search_query, radius=3000)
             if not discovery:
-                discovery = await text_search_api(f"{search_query} near {near}")
-            new_places = [r for r in discovery if r.get("name", "").lower() not in saved_names][:5]
+                discovery = await text_search_api(f"{search_query} near {effective_near}")
+            new_places = [r for r in discovery if r.get("name", "").lower() not in saved_names_lower][:5]
             if new_places:
                 lines.append("\n**You might also like:**\n")
                 for r in new_places:
@@ -655,14 +562,17 @@ async def search_my_places(
 
 
 @mcp.tool()
-async def get_place_info(place_name: str) -> str:
-    """Get detailed, real-time information about a specific place.
+async def place_details(place_name: str) -> str:
+    """Get detailed information about a specific place.
 
     Returns current hours, whether it's open now, full address, phone,
-    website, rating, reviews, and more. Works for both saved and unsaved places.
+    website, rating, expert reviews, dish recommendations, and more.
+    Auto-enriches from editorial sources if no expert data exists yet.
+
+    Use this when the user asks about a specific place — not for listing options.
 
     Args:
-        place_name: The name of the place to look up (e.g. "Joe's Pizza", "Blue Bottle Coffee Shibuya").
+        place_name: The name of the place (e.g. "Joe's Pizza", "Lucali").
     """
     user_id = get_current_user_id()
     places = load_places(user_id)
@@ -718,11 +628,17 @@ async def get_place_info(place_name: str) -> str:
             for day in hours["weekday_text"]:
                 lines.append(f"  {day}")
 
-    # Expert knowledge from shared DB
-    if place_id:
-        expert = format_expert_knowledge(place_id)
-        if expert:
-            lines.append(f"\nExpert notes:\n{expert}")
+    # Expert knowledge — auto-enrich if missing
+    expert = format_expert_knowledge(place_id)
+    if not expert and saved and saved.get("place_id"):
+        try:
+            from enrichment import enrich_one_place
+            await enrich_one_place(saved)
+            expert = format_expert_knowledge(place_id)
+        except Exception:
+            pass
+    if expert:
+        lines.append(f"\n{expert}")
 
     if details.get("url"):
         lines.append(f"Google Maps: {details['url']}")
@@ -731,99 +647,148 @@ async def get_place_info(place_name: str) -> str:
 
 
 @mcp.tool()
-async def discover_places(
-    query: str,
-    near: str = "",
-    radius_miles: float = 2.0,
-    include_saved: bool = True,
-) -> str:
-    """Discover new places beyond the user's saved list using Google Places search.
+async def import_places(csv_content: str, list_name: str = "default") -> str:
+    """Import saved places from a Google Takeout CSV file.
 
-    IMPORTANT: Always call search_my_places FIRST. Only use this tool to
-    supplement saved places with additional suggestions, or when the user
-    explicitly asks for places they haven't saved.
+    Users export their Google Maps saved places via Google Takeout,
+    which produces CSV files. They can paste the contents or attach the file.
+
+    On re-import, Roux diffs the data: adds new places, updates changed notes,
+    and flags removed places.
 
     Args:
-        query: What to search for (e.g. 'best pizza by the slice', 'trendy cocktail bar', 'late night ramen').
-        near: Location to search near (e.g. 'Times Square NYC', 'Shibuya Tokyo', 'West Village'). Uses default location if not provided.
-        radius_miles: Search radius in miles (default 2.0).
-        include_saved: Whether to flag which results are already in your saved places (default True).
-    """
-    if not GOOGLE_PLACES_API_KEY:
-        return "This tool requires a Google Places API key. Set the GOOGLE_PLACES_API_KEY environment variable."
-
-    location = near or DEFAULT_LOCATION
-    if not location:
-        return "Please specify a location with the 'near' parameter, or set ROUX_DEFAULT_LOCATION."
-
-    geo = await geocode_location(location)
-    if not geo:
-        return f"Could not find location: '{location}'. Try being more specific."
-
-    radius_meters = int(radius_miles * 1609.34)
-    results = await search_nearby_api(geo["lat"], geo["lng"], query=query, radius=radius_meters)
-
-    if not results:
-        results = await text_search_api(f"{query} near {location}")
-
-    if not results:
-        return f"No places found for '{query}' near {location}."
-
-    saved_names = set()
-    if include_saved:
-        user_id = get_current_user_id()
-        saved_names = {p["name"].lower() for p in load_places(user_id)}
-
-    lines = [f"Found {len(results)} place(s) for '{query}' near {location}:\n"]
-    for r in results[:10]:
-        is_saved = r.get("name", "").lower() in saved_names
-        name = r.get("name", "Unknown")
-        line = f"**{name}**" + (" (saved)" if is_saved else "")
-
-        if r.get("vicinity") or r.get("formatted_address"):
-            line += f"\n  Address: {r.get('vicinity') or r.get('formatted_address')}"
-        if r.get("rating"):
-            price = "$" * r["price_level"] if r.get("price_level") else ""
-            line += f"\n  Rating: {r['rating']}/5" + (f" | Price: {price}" if price else "")
-        if r.get("opening_hours", {}).get("open_now") is not None:
-            line += f"\n  Open now: {'Yes' if r['opening_hours']['open_now'] else 'No'}"
-        if r.get("business_status") and r["business_status"] != "OPERATIONAL":
-            line += f"\n  Status: {r['business_status']}"
-
-        lines.append(line)
-
-    return "\n\n".join(lines)
-
-
-@mcp.tool()
-async def add_note(place_name: str, note: str) -> str:
-    """Add or update a note on one of your saved places.
-
-    Args:
-        place_name: The name of the saved place to annotate.
-        note: The note to add (replaces any existing note).
+        csv_content: The full text content of a Google Takeout saved places CSV file.
+        list_name: A label for this list (e.g. 'Screenshots', 'Want to go'). Defaults to 'default'.
     """
     user_id = get_current_user_id()
-    places = load_places(user_id)
-    matched = None
-    for p in places:
-        if place_name.lower() in p.get("name", "").lower():
-            matched = p
-            break
 
-    if matched is None:
-        return f"No saved place matching '{place_name}'. Use search_my_places to find the exact name."
+    incoming = parse_takeout_csv(csv_content)
+    if not incoming:
+        return "No places found in the CSV. Make sure it's a Google Takeout saved places export."
 
-    db.update_user_place(matched["id"], {"note": note})
-    return f"Updated note for **{matched['name']}**: \"{note}\""
+    for p in incoming:
+        p["list"] = list_name
+
+    existing = db.load_user_places(user_id, list_name=list_name)
+    existing_by_key = {(p["name"], p.get("url", "")): p for p in existing}
+    incoming_by_key = {(p["name"], p.get("url", "")): p for p in incoming}
+
+    added, updated, removed = [], [], []
+
+    for key, p in incoming_by_key.items():
+        if key not in existing_by_key:
+            added.append(p)
+        else:
+            old = existing_by_key[key]
+            if p.get("note") != old.get("note") or p.get("comment") != old.get("comment"):
+                updated.append({"id": old["id"], "note": p.get("note", ""), "comment": p.get("comment", "")})
+
+    for key, p in existing_by_key.items():
+        if key not in incoming_by_key:
+            removed.append(p)
+
+    if added:
+        if GOOGLE_PLACES_API_KEY:
+            for i, p in enumerate(added):
+                if not p.get("enriched") and p["name"]:
+                    added[i] = await enrich_place(p)
+        db.upsert_user_places(user_id, added)
+
+    for u in updated:
+        db.update_user_place(u["id"], {"note": u["note"], "comment": u["comment"]})
+
+    lines = [f"**Import sync for '{list_name}':**"]
+    if added:
+        lines.append(f"  Added: {len(added)} new places")
+    if updated:
+        lines.append(f"  Updated: {len(updated)} places (notes changed)")
+    if removed:
+        names = ", ".join(p["name"] for p in removed[:5])
+        more = f" and {len(removed) - 5} more" if len(removed) > 5 else ""
+        lines.append(f"  No longer in export: {len(removed)} places ({names}{more})")
+        lines.append("  These weren't deleted — they may be in a different Google Maps list. Say 'remove them' if you want to clean up.")
+    if not added and not updated and not removed:
+        lines.append("  Everything is up to date — no changes detected.")
+
+    total = len(db.load_user_places(user_id))
+    lines.append(f"  Total places: {total}")
+    return "\n".join(lines)
 
 
 @mcp.tool()
-async def my_places_stats() -> str:
-    """Get a summary of your saved places database.
+async def taste_profile(content: str = "") -> str:
+    """Read or update the user's dining taste profile.
+
+    Call with no arguments to read the current profile.
+    Call with content to replace the profile.
+
+    The profile captures preferences, patterns, and dining style.
+    Read it before making recommendations to personalize suggestions.
+
+    Args:
+        content: If provided, replaces the taste profile with this content (markdown). If empty, returns the current profile.
+    """
+    user_id = get_current_user_id()
+
+    if content:
+        db.upsert_user_taste_profile(user_id, content)
+        return "Taste profile updated."
+
+    profile = db.get_user_taste_profile(user_id)
+    if not profile:
+        return "No taste profile yet. You can start one by telling me about your preferences, or I can analyze your saved places to generate an initial profile. Just say 'build my taste profile'."
+    return profile
+
+
+@mcp.tool()
+async def locations(action: str = "get", label: str = "", location: str = "") -> str:
+    """Read or save the user's named locations.
+
+    Call with action="get" (default) to list all saved locations.
+    Call with action="save" to save a new named location.
+
+    Users can reference saved locations naturally in searches:
+    "near home", "by work", "near my brother's place".
+
+    Args:
+        action: "get" to list locations, "save" to save one.
+        label: Name for the location (e.g. 'home', 'work', 'brother', 'hotel'). Required for save.
+        location: The address or area (e.g. '2 Cornelia St, NYC', 'Fort Greene, Brooklyn'). Required for save.
+    """
+    user_id = get_current_user_id()
+
+    if action == "save":
+        if not label or not location:
+            return "Need both a label and location. Example: locations(action='save', label='home', location='West Village, NYC')"
+        db.set_user_locations(user_id, {label.lower().strip(): location})
+        all_locations = db.get_user_locations(user_id)
+        saved_list = ", ".join(f"**{k}**: {v}" for k, v in all_locations.items())
+        return f"Saved! Your locations: {saved_list}"
+
+    # Default: get
+    user_locations = db.get_user_locations(user_id)
+    if not user_locations:
+        return (
+            "You don't have any locations saved yet. Share your places so you can "
+            "reference them naturally anytime — like 'near home' or 'by my office.'\n\n"
+            "You can share things like your home address, what neighborhood your "
+            "office is in, your go-to hotels when traveling for work, your vacation "
+            "home, or where friends and family live. Anything you might want to "
+            "reference when looking for a place to eat.\n\n"
+            "Start with your home address and add anything else whenever it comes up."
+        )
+    lines = ["Your saved locations:"]
+    for lbl, loc in user_locations.items():
+        lines.append(f"  **{lbl}**: {loc}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def my_stats() -> str:
+    """Get a summary of the user's saved places database.
 
     Shows total count, breakdown by list, top cuisines/types,
-    and cities. Useful for understanding your taste profile.
+    and cities.
     """
     user_id = get_current_user_id()
     places = load_places(user_id)
@@ -878,120 +843,6 @@ async def my_places_stats() -> str:
         lines.append(f"\n**Average rating of saved places:** {avg_rating:.1f}/5")
 
     return "\n".join(lines)
-
-
-@mcp.tool()
-async def get_taste_profile() -> str:
-    """Get the user's dining taste profile.
-
-    Returns their preferences, patterns, deal-breakers, and dining style.
-    Read this before making recommendations to personalize your suggestions.
-    If no profile exists yet, suggest building one based on their saved places.
-    """
-    user_id = get_current_user_id()
-    profile = db.get_user_taste_profile(user_id)
-    if not profile:
-        return "No taste profile yet. You can start one by telling me about your preferences, or I can analyze your saved places to generate an initial profile. Just say 'build my taste profile'."
-    return profile
-
-
-@mcp.tool()
-async def enrich_place_expert(place_name: str) -> str:
-    """Fetch expert reviews and dish recommendations for a saved place from trusted editorial sources.
-
-    Searches The Infatuation, Eater, Grub Street, NYT, and other approved sources,
-    extracts what to order, what to skip, and stores it in the shared expert database.
-    Results will appear in future searches and get_place_info calls.
-
-    Args:
-        place_name: Name of the saved place to enrich (e.g. "Peter Luger", "Don Angie").
-    """
-    user_id = get_current_user_id()
-    places = load_places(user_id)
-    matched = next((p for p in places if place_name.lower() in p.get("name", "").lower()), None)
-    if not matched:
-        return f"No saved place matching '{place_name}'. Use search_my_places to find the exact name."
-
-    if not matched.get("place_id"):
-        return f"'{matched['name']}' doesn't have a Google Place ID yet. Try importing again with a fresh Takeout export."
-
-    try:
-        from enrichment import enrich_one_place
-        success = await enrich_one_place(matched)
-        if success:
-            expert = format_expert_knowledge(matched["place_id"])
-            if expert:
-                return f"Enriched **{matched['name']}**:\n{expert}"
-            return f"Enriched **{matched['name']}** — no editorial coverage found yet."
-        return f"Could not enrich **{matched['name']}** — check that ANTHROPIC_API_KEY is set and the place has editorial coverage."
-    except Exception as e:
-        return f"Enrichment error: {e}"
-
-
-@mcp.tool()
-async def save_location(label: str, location: str) -> str:
-    """Save a named location so the user can reference it naturally.
-
-    Call this when the user shares where they live, work, or any place
-    they want to reference later. 'home' is used as the default for
-    'near me' queries.
-
-    Examples:
-        save_location("home", "2 Cornelia St, New York, NY")
-        save_location("work", "near Astor Place, NYC")
-        save_location("brother", "Fort Greene, Brooklyn")
-        save_location("parents", "Saratoga Springs, NY")
-
-    Args:
-        label: A short name for this location (e.g. 'home', 'work', 'brother', 'hotel').
-        location: The address, neighborhood, or description of the location.
-    """
-    user_id = get_current_user_id()
-    db.set_user_locations(user_id, {label.lower().strip(): location})
-    all_locations = db.get_user_locations(user_id)
-    saved_list = ", ".join(f"**{k}**: {v}" for k, v in all_locations.items())
-    return f"Saved! Your locations: {saved_list}"
-
-
-@mcp.tool()
-async def get_my_locations() -> str:
-    """Get the user's saved locations.
-
-    Returns all named locations the user has saved (home, work, etc.).
-    If none are set, provides onboarding instructions.
-    """
-    user_id = get_current_user_id()
-    locations = db.get_user_locations(user_id)
-    if not locations:
-        return (
-            "You don't have any locations saved yet. Share your places so you can "
-            "reference them naturally anytime — like 'near home' or 'by my office.'\n\n"
-            "You can share things like your home address, what neighborhood your "
-            "office is in, your go-to hotels when traveling for work, your vacation "
-            "home, or where friends and family live. Anything you might want to "
-            "reference when looking for a place to eat.\n\n"
-            "Start with your home address and add anything else whenever it comes up."
-        )
-    lines = ["Your saved locations:"]
-    for label, loc in locations.items():
-        lines.append(f"  **{label}**: {loc}")
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def update_taste_profile(updates: str) -> str:
-    """Update the user's dining taste profile with new preferences or feedback.
-
-    Call this when the user shares dining preferences, meal feedback, or
-    patterns you've observed. The profile is a markdown document — append
-    or edit sections as needed.
-
-    Args:
-        updates: The complete updated taste profile content (markdown). This replaces the existing profile, so include all existing content plus your changes.
-    """
-    user_id = get_current_user_id()
-    db.upsert_user_taste_profile(user_id, updates)
-    return "Taste profile updated."
 
 
 # ---------------------------------------------------------------------------
