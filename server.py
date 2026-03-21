@@ -84,14 +84,29 @@ don't just quote verbatim.
 - Use place_details when the user asks about a specific place (hours, what to order, \
 deep dive) — not for listing multiple options.
 
-**Formatting — IMPORTANT:**
-- Write conversational commentary about each place, but ALWAYS follow it with \
-the structured card from the tool output. Every place mentioned gets both: \
-the narrative AND the card. The card uses the format returned by the tool \
-(bold name · rating · price · location, address, notes, dishes). \
-Do not skip the card or only show commentary.
+**Formatting — follow this example closely:**
 
-See STYLE_GUIDE.md in the Roux repository for the complete guide.\
+User: "Best tacos near me?"
+
+Response:
+"Hey Elliott — **🦘 Roux** here. You've got a great taco spot saved nearby.
+
+**Tacos Don Juan** · 4.6★ · $ · 0.7 mi · saved
+110 Forsyth St, New York, NY
+You noted: tacos de suadero, quesabirria, taco de maciza, check the special too.
+→ Order: tacos de suadero, quesabirria
+
+A couple spots you haven't saved that are worth knowing about:
+
+**Los Tacos No.1** · 4.8★ · $ · 1.2 mi
+340 Lafayette St, New York, NY
+→ Order: asada, handmade tortillas
+
+Want more options or details on any of these?"
+
+Key rules: Each place gets the bold name · metadata line, address, and \
+dish recommendations. Keep commentary brief — a sentence or two, not a \
+paragraph. Let the card do the heavy lifting.\
 """
 
 # Initialize FastMCP server
@@ -559,7 +574,11 @@ async def search_places(
     if not results:
         lines = ["No saved places match your search."]
     else:
+        # Check how many places have expert data
+        enriched_count = sum(1 for r in results if r["place"].get("place_id") and format_expert_knowledge(r["place"]["place_id"]))
         lines = [f"**From your saved places** ({len(results)} match):\n"]
+        if enriched_count == 0 and len(results) > 0:
+            lines.append("_Note: Expert dish recommendations are still being processed for your places. Results will get richer over time._\n")
         saved_names = set()
         for r in results:
             p = r["place"]
@@ -741,6 +760,10 @@ async def import_places(csv_content: str, list_name: str = "default") -> str:
 
     total = len(db.load_user_places(user_id))
     lines.append(f"  Total places: {total}")
+
+    if added:
+        lines.append(f"\nYour places are being enriched with expert reviews and dish recommendations from sources like The Infatuation, NYT, Eater, and more. This runs in the background and can take a while for large lists. You can start asking questions right away — recommendations will get richer as enrichment completes.")
+
     return "\n".join(lines)
 
 
