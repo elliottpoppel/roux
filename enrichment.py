@@ -27,10 +27,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Add parent dir to path so we can import db and server helpers
+# Add parent dir to path so we can import db
 sys.path.insert(0, str(Path(__file__).parent))
 import db
-from server import load_places
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -366,13 +365,22 @@ async def enrich_one_place(place: dict) -> bool:
     return enriched_any
 
 
-async def run_enrichment(filter_name: str | None = None, force: bool = False):
+async def run_enrichment(filter_name: str | None = None, force: bool = False, user_id: str | None = None):
     """Run enrichment pipeline across saved places."""
     if not db.get_client():
         logger.error("No Supabase connection — check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY")
         return
 
-    places = load_places()
+    # Load places for a specific user, or all users
+    if user_id:
+        places = db.load_user_places(user_id)
+    else:
+        # Enrich places for all users
+        client = db.get_client()
+        all_users = client.table("users").select("id").execute()
+        places = []
+        for u in (all_users.data or []):
+            places.extend(db.load_user_places(u["id"]))
     if filter_name:
         places = [p for p in places if filter_name.lower() in p.get("name", "").lower()]
         logger.info(f"Filtered to {len(places)} places matching '{filter_name}'")
@@ -403,6 +411,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Roux enrichment pipeline")
     parser.add_argument("--place", help="Enrich a specific place by name")
     parser.add_argument("--all", action="store_true", help="Re-enrich all places")
+    parser.add_argument("--user-id", help="Enrich places for a specific user ID")
     args = parser.parse_args()
 
-    asyncio.run(run_enrichment(filter_name=args.place, force=args.all))
+    asyncio.run(run_enrichment(filter_name=args.place, force=args.all, user_id=args.user_id))
