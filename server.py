@@ -47,11 +47,22 @@ On first message in a conversation, greet the user by first name and introduce \
 yourself: "Hey [name] — **🦘 Roux** here." After that, only reference Roux by \
 name when it comes up naturally.
 
-If the user has no saved locations, call locations() which will show \
-them onboarding instructions for sharing their places. When a user shares \
-a location naturally (e.g. "I live in the West Village"), save it with \
-locations(action="save", label="home", location="West Village, NYC") \
-without asking for confirmation.
+**New user onboarding (first interaction):**
+If the user has no saved places (import_places hasn't been run), walk them \
+through setup:
+1. First, ask where they're based and save it with locations(action="save").
+2. Then guide them through importing their Google Maps saved places:
+   "To get your saved places into Roux, do a quick Google Takeout export:
+   1. Go to **takeout.google.com**
+   2. Click 'Deselect all,' then scroll to **Saved** (the list is alphabetical — under S)
+   3. Click 'Next step' → 'Create export'
+   4. When the download is ready (usually 2-5 min), download and unzip it
+   5. Inside you'll see a Saved folder with CSV files — drop them all here"
+3. Even without saved places, Roux can discover restaurants. Don't block \
+the user from using Roux before they import.
+
+When a user shares a location naturally (e.g. "I live in the West Village"), \
+save it with locations(action="save") without asking for confirmation.
 
 **How to respond:**
 - Voice: Direct, knowledgeable friend. Not a food critic. No "elevated" or "curated."
@@ -476,7 +487,15 @@ async def search_places(
     user_id = get_current_user_id()
     places = load_places(user_id)
     if not places:
-        return "No places in your database yet. Use import_places to load your Google Takeout export."
+        return (
+            "No saved places imported yet. To get your Google Maps saves into Roux:\n\n"
+            "1. Go to **takeout.google.com**\n"
+            "2. Click 'Deselect all,' then scroll to **Saved** (the list is alphabetical — under S)\n"
+            "3. Click 'Next step' → 'Create export'\n"
+            "4. When the download is ready (usually 2-5 min), download and unzip it\n"
+            "5. Inside you'll see a Saved folder with CSV files — drop them all here\n\n"
+            "Even without your saved places, I can still help you discover restaurants. Just ask!"
+        )
 
     # Resolve 'near' — check saved locations, then fall back to 'home'
     near_coords = None
@@ -803,7 +822,7 @@ async def my_stats() -> str:
     user_id = get_current_user_id()
     places = load_places(user_id)
     if not places:
-        return "No places in your database yet. Use import_places to get started."
+        return "No places imported yet. Import your Google Maps saved places first — ask me how if you need help."
 
     total = len(places)
     enriched = sum(1 for p in places if p.get("enriched"))
