@@ -505,6 +505,10 @@ async def search_places(
     query_lower = query.lower()
 
     for p in places:
+        # Skip permanently closed places
+        if p.get("business_status") == "CLOSED_PERMANENTLY":
+            continue
+
         if query_lower:
             searchable = f"{p.get('name', '')} {p.get('note', '')} {p.get('comment', '')} {' '.join(p.get('types', []))}".lower()
             name_match = query_lower in searchable
@@ -599,6 +603,12 @@ async def place_details(place_name: str) -> str:
     details = await get_place_details_api(place_id)
     if not details:
         return f"Could not fetch details for '{place_name}'."
+
+    # Detect permanent closure and update the record
+    if details.get("business_status") == "CLOSED_PERMANENTLY":
+        if saved:
+            db.update_user_place(saved["id"], {"business_status": "CLOSED_PERMANENTLY"})
+        return f"**{details.get('name', place_name)}** is permanently closed."
 
     lines = [f"**{details.get('name', place_name)}**"]
 
