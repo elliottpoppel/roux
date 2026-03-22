@@ -2,13 +2,12 @@
 Roux — Re-enrichment script.
 
 Re-resolves all saved places via CID (exact match from Google Maps URL),
-cleans up stale expert data for changed place_ids, and re-runs editorial
-enrichment from scratch.
+wipes all expert data, and re-runs editorial enrichment from scratch.
 
 Usage:
     uv run python reenrich.py                  # dry run — show what would change
     uv run python reenrich.py --apply          # re-resolve place IDs and update DB
-    uv run python reenrich.py --apply --enrich # also re-run editorial enrichment
+    uv run python reenrich.py --apply --enrich # also wipe + re-run editorial enrichment
 """
 
 import argparse
@@ -42,6 +41,7 @@ async def reenrich_places(dry_run: bool = True, run_editorial: bool = False):
     places = db.load_user_places(USER_ID)
     logger.info(f"Loaded {len(places)} saved places")
 
+    # --- Step 1: Re-resolve place IDs via CID ---
     changed = 0
     unchanged = 0
     errors = 0
@@ -90,38 +90,38 @@ async def reenrich_places(dry_run: bool = True, run_editorial: bool = False):
                 "business_status": enriched.get("business_status", ""),
             })
 
-            # Clean up stale expert data for the old place_id
-            old_expert = db.get_expert_place(old_place_id)
-            if old_expert:
-                expert_id = old_expert["id"]
-                # Check if any other user still references this place_id
-                other_refs = client.table("user_places").select("id").eq(
-                    "place_id", old_place_id
-                ).neq("id", place["id"]).limit(1).execute()
-                if not other_refs.data:
-                    # No other users reference it — safe to delete
-                    client.table("place_dishes").delete().eq("expert_place_id", expert_id).execute()
-                    client.table("place_reviews").delete().eq("expert_place_id", expert_id).execute()
-                    client.table("guide_mentions").delete().eq("expert_place_id", expert_id).execute()
-                    client.table("expert_places").delete().eq("id", expert_id).execute()
-                    logger.info(f"       Cleaned up stale expert data for old place_id")
-
         await asyncio.sleep(0.2)  # Rate limit Google API
 
-    logger.info(f"\nResults: {changed} changed, {unchanged} unchanged, {errors} errors")
+    logger.info(f"\nStep 1 results: {changed} changed, {unchanged} unchanged, {errors} errors")
 
-    if dry_run and changed > 0:
-        logger.info("Run with --apply to update the database")
+    if dry_run:
+        if changed > 0:
+            logger.info("Run with --apply to update the database")
         return
 
-    if not dry_run and run_editorial:
-        # Clear last_enriched_at so editorial enrichment re-runs
-        logger.info("\nClearing enrichment timestamps for fresh editorial pass...")
-        client.table("expert_places").update(
-            {"last_enriched_at": None}
-        ).neq("id", "00000000-0000-0000-0000-000000000000").execute()
+    # --- Step 2: Wipe ALL expert data ---
+    if run_editorial:
+        logger.info("\nStep 2: Wiping all expert data for clean re-enrichment...")
 
-        logger.info("Running editorial enrichment...")
+        # Get all expert_place IDs that belong to this user's places
+        user_places = db.load_user_places(USER_ID)
+        place_ids = {p.get("place_id") for p in user_places if p.get("place_id")}
+
+        wiped = 0
+        for pid in place_ids:
+            expert = db.get_expert_place(pid)
+            if expert:
+                eid = expert["id"]
+                client.table("place_dishes").delete().eq("expert_place_id", eid).execute()
+                client.table("place_reviews").delete().eq("expert_place_id", eid).execute()
+                client.table("guide_mentions").delete().eq("expert_place_id", eid).execute()
+                client.table("expert_places").delete().eq("id", eid).execute()
+                wiped += 1
+
+        logger.info(f"Wiped expert data for {wiped} places")
+
+        # --- Step 3: Re-run editorial enrichment ---
+        logger.info("\nStep 3: Running editorial enrichment from scratch...")
         from enrichment import run_enrichment
         await run_enrichment(force=True, user_id=USER_ID)
 
@@ -129,7 +129,7 @@ async def reenrich_places(dry_run: bool = True, run_editorial: bool = False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Re-enrich all places via CID")
     parser.add_argument("--apply", action="store_true", help="Apply changes (default is dry run)")
-    parser.add_argument("--enrich", action="store_true", help="Also re-run editorial enrichment")
+    parser.add_argument("--enrich", action="store_true", help="Also wipe + re-run editorial enrichment")
     args = parser.parse_args()
 
     asyncio.run(reenrich_places(dry_run=not args.apply, run_editorial=args.enrich))

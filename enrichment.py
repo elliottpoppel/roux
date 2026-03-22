@@ -54,7 +54,7 @@ SOURCE_DOMAINS = [
 
 EXTRACTION_PROMPT = """You are extracting structured data from a restaurant review or guide.
 
-FIRST: Check if this article is actually about the restaurant "{name}" in {city}. If the article is about a DIFFERENT restaurant with a similar name, or about a restaurant in a different city, return: {{"wrong_match": true}}
+FIRST: Check if this article is actually about the restaurant "{name}" at {address}. The article must be about this EXACT restaurant — not a different restaurant with a similar name, not a different location/branch, not a recipe. If it's not about this specific place, return: {{"wrong_match": true}}
 
 If the article IS about the right restaurant, return a JSON object with these fields:
 - "wrong_match": false
@@ -70,7 +70,7 @@ If the article IS about the right restaurant, return a JSON object with these fi
 IMPORTANT: Keep the dish list tight. Only include genuinely distinct menu items. A place with 3 things on the menu should have ~3 dishes, not 10 variations.
 
 Restaurant: {name}
-City/Location: {city}
+Address: {address}
 Article title: {title}
 Article text:
 {text}
@@ -186,7 +186,7 @@ async def fetch_article(url: str) -> tuple[str, str]:
             return "", ""
 
 
-def extract_with_llm(place_name: str, title: str, text: str, city: str = "") -> dict | None:
+def extract_with_llm(place_name: str, title: str, text: str, address: str = "") -> dict | None:
     """Use Claude to extract structured dish/review data from article text."""
     if not ANTHROPIC_API_KEY:
         logger.warning("No ANTHROPIC_API_KEY — skipping LLM extraction")
@@ -195,7 +195,7 @@ def extract_with_llm(place_name: str, title: str, text: str, city: str = "") -> 
         return None
 
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    prompt = EXTRACTION_PROMPT.format(name=place_name, city=city or "unknown", title=title, text=text[:6000])
+    prompt = EXTRACTION_PROMPT.format(name=place_name, address=address or "unknown", title=title, text=text[:6000])
 
     try:
         message = client.messages.create(
@@ -312,7 +312,7 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
         if not text:
             continue
 
-        extracted = extract_with_llm(name, title, text, city=city)
+        extracted = extract_with_llm(name, title, text, address=address)
         if not extracted:
             continue
         if extracted.get("wrong_match"):
