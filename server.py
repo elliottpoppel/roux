@@ -164,7 +164,15 @@ def get_current_user_id() -> str:
         if token is not None:
             return db.get_or_create_user(token.client_id)
     except Exception as e:
-        logger.error(f"Auth error: {e}")
+        logger.debug(f"No auth token (expected in stdio mode): {e}")
+
+    # No auth context (stdio/local mode) — use sole user if single-tenant
+    client = db.get_client()
+    if client:
+        all_users = client.table("users").select("id").execute()
+        if all_users.data and len(all_users.data) == 1:
+            return all_users.data[0]["id"]
+
     return "local"
 
 
