@@ -283,21 +283,30 @@ async def enrich_place(place: dict) -> dict:
                 data = resp.json()
                 result = data.get("result")
                 if result:
-                    geo = result.get("geometry", {}).get("location", {})
-                    place.update({
-                        "place_id": result.get("place_id", ""),
-                        "address": result.get("formatted_address", place.get("address", "")),
-                        "lat": geo.get("lat"),
-                        "lng": geo.get("lng"),
-                        "types": result.get("types", []),
-                        "price_level": result.get("price_level"),
-                        "rating": result.get("rating"),
-                        "phone": result.get("formatted_phone_number", ""),
-                        "website": result.get("website", ""),
-                        "business_status": result.get("business_status", ""),
-                        "enriched": True,
-                    })
-                    return place
+                    # Verify the CID resolved to the right place (not a recycled/stale CID)
+                    resolved_name = result.get("name", "").lower()
+                    saved_name = place["name"].lower()
+                    # Check if names share a significant word (handles "Corner Bistro" vs "Corner Bistro East")
+                    saved_words = {w for w in saved_name.split() if len(w) > 2}
+                    resolved_words = {w for w in resolved_name.split() if len(w) > 2}
+                    if saved_words & resolved_words:
+                        geo = result.get("geometry", {}).get("location", {})
+                        place.update({
+                            "place_id": result.get("place_id", ""),
+                            "address": result.get("formatted_address", place.get("address", "")),
+                            "lat": geo.get("lat"),
+                            "lng": geo.get("lng"),
+                            "types": result.get("types", []),
+                            "price_level": result.get("price_level"),
+                            "rating": result.get("rating"),
+                            "phone": result.get("formatted_phone_number", ""),
+                            "website": result.get("website", ""),
+                            "business_status": result.get("business_status", ""),
+                            "enriched": True,
+                        })
+                        return place
+                    else:
+                        logger.warning(f"CID name mismatch for {place['name']}: resolved to '{result.get('name')}'— falling back to name search")
             except Exception as e:
                 logger.error(f"CID lookup error for {place['name']}: {e}")
 

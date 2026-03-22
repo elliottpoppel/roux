@@ -235,7 +235,7 @@ def get_source_id_for_url(url: str) -> str | None:
     return None
 
 
-async def enrich_one_place(place: dict) -> bool:
+async def enrich_one_place(place: dict, force: bool = False) -> bool:
     """Enrich a single saved place with expert knowledge. Returns True if enriched."""
     name = place.get("name", "")
     place_id = place.get("place_id", "")
@@ -270,8 +270,8 @@ async def enrich_one_place(place: dict) -> bool:
 
     expert_id = stored["id"]
 
-    # Skip full enrichment if already enriched recently
-    if existing and existing.get("last_enriched_at"):
+    # Skip full enrichment if already enriched recently (unless forced)
+    if not force and existing and existing.get("last_enriched_at"):
         logger.info(f"Already enriched: {name}")
         return True
 
@@ -410,7 +410,7 @@ async def run_enrichment(filter_name: str | None = None, force: bool = False, us
     for i, place in enumerate(places):
         logger.info(f"[{i+1}/{len(places)}] {place.get('name')}")
         try:
-            if await enrich_one_place(place):
+            if await enrich_one_place(place, force=force):
                 success += 1
         except Exception as e:
             logger.error(f"Error enriching {place.get('name')}: {e}")
