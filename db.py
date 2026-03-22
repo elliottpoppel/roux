@@ -184,29 +184,29 @@ def upsert_user_taste_profile(user_id: str, content: str):
 # ---------------------------------------------------------------------------
 
 
-def get_expert_place(google_place_id: str) -> dict | None:
+def get_place(google_place_id: str) -> dict | None:
     db = get_client()
     if not db:
         return None
-    result = db.table("expert_places").select("*").eq("google_place_id", google_place_id).execute()
+    result = db.table("places").select("*").eq("google_place_id", google_place_id).execute()
     return result.data[0] if result.data else None
 
 
 def get_enriched_place_ids(google_place_ids: list[str]) -> set[str]:
-    """Return the subset of google_place_ids that have expert_places records. Single query."""
+    """Return the subset of google_place_ids that have places records. Single query."""
     db = get_client()
     if not db or not google_place_ids:
         return set()
-    result = db.table("expert_places").select("google_place_id").in_("google_place_id", google_place_ids).execute()
+    result = db.table("places").select("google_place_id").in_("google_place_id", google_place_ids).execute()
     return {r["google_place_id"] for r in (result.data or [])}
 
 
-def upsert_expert_place(place: dict) -> dict | None:
+def upsert_place(place: dict) -> dict | None:
     """Insert or update an expert place. Returns the stored record."""
     db = get_client()
     if not db:
         return None
-    result = db.table("expert_places").upsert(place, on_conflict="google_place_id").execute()
+    result = db.table("places").upsert(place, on_conflict="google_place_id").execute()
     return result.data[0] if result.data else None
 
 
@@ -451,7 +451,7 @@ def get_expert_knowledge(google_place_id: str) -> dict | None:
     if not db:
         return None
 
-    expert = get_expert_place(google_place_id)
+    expert = get_place(google_place_id)
     if not expert:
         return None
 
@@ -488,15 +488,15 @@ def search_dishes_by_keyword(keyword: str) -> set[str]:
 
     result = (
         db.table("place_dishes")
-        .select("expert_place_id, expert_places(google_place_id)")
+        .select("expert_place_id, places(google_place_id)")
         .ilike("dish_name", f"%{keyword}%")
         .limit(100)
         .execute()
     )
     return {
-        r["expert_places"]["google_place_id"]
+        r["places"]["google_place_id"]
         for r in (result.data or [])
-        if r.get("expert_places", {}).get("google_place_id")
+        if r.get("places", {}).get("google_place_id")
     }
 
 
@@ -508,7 +508,7 @@ def search_expert_by_dish(dish_query: str, city: str | None = None) -> list[dict
 
     q = (
         db.table("place_dishes")
-        .select("*, expert_places(*), sources(name, quality_rank)")
+        .select("*, places(*), sources(name, quality_rank)")
         .textSearch("dish_name", dish_query, config="english")
         .in_("sentiment", ["must_order", "recommended"])
         .order("sources(quality_rank)")
@@ -517,6 +517,6 @@ def search_expert_by_dish(dish_query: str, city: str | None = None) -> list[dict
     results = q.execute().data or []
 
     if city:
-        results = [r for r in results if r.get("expert_places", {}).get("city", "").lower() == city.lower()]
+        results = [r for r in results if r.get("places", {}).get("city", "").lower() == city.lower()]
 
     return results

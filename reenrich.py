@@ -2,7 +2,7 @@
 Roux — Re-enrichment script.
 
 Re-resolves all saved places via CID (exact match from Google Maps URL),
-wipes all expert data, and re-runs editorial enrichment from scratch.
+wipes all enrichment data, and re-runs editorial enrichment from scratch.
 
 Usage:
     uv run python reenrich.py                  # dry run — show what would change
@@ -99,26 +99,26 @@ async def reenrich_places(dry_run: bool = True, run_editorial: bool = False):
             logger.info("Run with --apply to update the database")
         return
 
-    # --- Step 2: Wipe ALL expert data ---
+    # --- Step 2: Wipe ALL enrichment data ---
     if run_editorial:
-        logger.info("\nStep 2: Wiping all expert data for clean re-enrichment...")
+        logger.info("\nStep 2: Wiping all enrichment data for clean re-enrichment...")
 
-        # Get all expert_place IDs that belong to this user's places
+        # Get all place IDs that belong to this user's places
         user_places = db.load_user_places(USER_ID)
         place_ids = {p.get("place_id") for p in user_places if p.get("place_id")}
 
         wiped = 0
         for pid in place_ids:
-            expert = db.get_expert_place(pid)
+            expert = db.get_place(pid)
             if expert:
                 eid = expert["id"]
                 client.table("place_dishes").delete().eq("expert_place_id", eid).execute()
                 client.table("place_reviews").delete().eq("expert_place_id", eid).execute()
                 client.table("guide_mentions").delete().eq("expert_place_id", eid).execute()
-                client.table("expert_places").delete().eq("id", eid).execute()
+                client.table("places").delete().eq("id", eid).execute()
                 wiped += 1
 
-        logger.info(f"Wiped expert data for {wiped} places")
+        logger.info(f"Wiped enrichment data for {wiped} places")
 
         # --- Step 3: Re-run editorial enrichment ---
         logger.info("\nStep 3: Running editorial enrichment from scratch...")

@@ -282,7 +282,7 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
             pass
 
     # Check if already in expert DB
-    existing = db.get_expert_place(place_id)
+    existing = db.get_place(place_id)
 
     # Upsert expert place record
     expert_record = {
@@ -298,7 +298,7 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
         "website": website,
         "phone": place.get("phone", ""),
     }
-    stored = db.upsert_expert_place(expert_record)
+    stored = db.upsert_place(expert_record)
     if not stored:
         logger.error(f"Failed to upsert expert place: {name}")
         return False
@@ -341,7 +341,7 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
     else:
         logger.info(f"No search results for {name}")
         # Mark as enriched (even if no results) so we don't retry every time
-        db.upsert_expert_place({**expert_record, "last_enriched_at": "now()", "pipeline_version": PIPELINE_VERSION})
+        db.upsert_place({**expert_record, "last_enriched_at": "now()", "pipeline_version": PIPELINE_VERSION})
         return True
 
     enriched_any = False
@@ -448,7 +448,7 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
                     if not is_dining_place(resolved.get("types", [])):
                         continue
 
-                    # Upsert expert_place (don't set last_enriched_at — this is partial data)
+                    # Upsert place (don't set last_enriched_at — this is partial data)
                     gp_record = {
                         "google_place_id": resolved["place_id"],
                         "name": resolved["name"],
@@ -460,7 +460,7 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
                         "price_level": resolved.get("price_level"),
                         "google_rating": resolved.get("rating"),
                     }
-                    stored_gp = db.upsert_expert_place(gp_record)
+                    stored_gp = db.upsert_place(gp_record)
                     if not stored_gp:
                         continue
 
@@ -498,7 +498,7 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
         db.batch_upsert_dishes(expert_id, all_extracted_dishes)
 
     # Mark as enriched with current pipeline version
-    db.upsert_expert_place({**expert_record, "last_enriched_at": "now()", "pipeline_version": PIPELINE_VERSION})
+    db.upsert_place({**expert_record, "last_enriched_at": "now()", "pipeline_version": PIPELINE_VERSION})
     return enriched_any
 
 
@@ -551,7 +551,7 @@ async def run_enrichment(filter_name: str | None = None, force: bool = False,
         # Filter to places that need enrichment: unenriched OR outdated pipeline version
         needs_enrichment = []
         for p in places:
-            existing = db.get_expert_place(p["place_id"])
+            existing = db.get_place(p["place_id"])
             if not existing:
                 needs_enrichment.append(p)
             elif upgrade or (existing.get("pipeline_version", 0) or 0) < PIPELINE_VERSION:
