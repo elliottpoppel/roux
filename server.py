@@ -161,17 +161,24 @@ def get_current_user_id() -> str:
     """Extract a stable user ID from the current auth context."""
     try:
         token = get_access_token()
+        logger.info(f"Auth token: {token}, client_id={getattr(token, 'client_id', 'N/A')}")
         if token is not None:
-            return db.get_or_create_user(token.client_id)
+            uid = db.get_or_create_user(token.client_id)
+            logger.info(f"Resolved user_id: {uid}")
+            return uid
     except Exception as e:
-        logger.debug(f"No auth token (expected in stdio mode): {e}")
+        logger.warning(f"get_access_token failed: {type(e).__name__}: {e}")
 
     # No auth context (stdio/local mode) — use sole user if single-tenant
+    logger.info("No auth token — trying single-tenant fallback")
     client = db.get_client()
     if client:
         all_users = client.table("users").select("id").execute()
+        logger.info(f"Users in DB: {len(all_users.data or [])}")
         if all_users.data and len(all_users.data) == 1:
-            return all_users.data[0]["id"]
+            uid = all_users.data[0]["id"]
+            logger.info(f"Single-tenant fallback: {uid}")
+            return uid
 
     return "local"
 
