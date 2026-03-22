@@ -18,6 +18,8 @@ from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
 from typing import Any
 
+import re
+
 import httpx
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_access_token
@@ -244,22 +246,73 @@ async def geocode_location(location_query: str) -> dict | None:
     return None
 
 
+def _extract_cid(url: str) -> int | None:
+    """Extract the Google Maps CID from a Takeout URL.
+
+    URLs look like: .../data=!4m2!3m1!1s0x...:0xce4ee8d8fe562753
+    The CID is the hex number after the last ':0x'.
+    """
+    match = re.search(r":0x([0-9a-f]+)", url or "")
+    if match:
+        return int(match.group(1), 16)
+    return None
+
+
 async def enrich_place(place: dict) -> dict:
-    """Enrich a place with data from Google Places API (Find Place endpoint)."""
+    """Enrich a place with data from Google Places API.
+
+    Tries CID lookup first (exact match from Google Maps URL),
+    falls back to Find Place by name.
+    """
     if not GOOGLE_PLACES_API_KEY:
         return place
 
-    url = "https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
-    params = {
-        "input": place["name"] + (" " + place["address"] if place.get("address") else ""),
-        "inputtype": "textquery",
-        "fields": "place_id,name,formatted_address,geometry,types,price_level,rating,business_status",
-        "key": GOOGLE_PLACES_API_KEY,
-    }
+    fields = "place_id,name,formatted_address,geometry,types,price_level,rating,business_status"
 
     async with httpx.AsyncClient() as client:
+        # Try CID lookup first — exact match, no ambiguity
+        cid = _extract_cid(place.get("url", ""))
+        if cid:
+            try:
+                resp = await client.get(
+                    "https://maps.googleapis.com/maps/api/place/details/json",
+                    params={"cid": str(cid), "fields": fields, "key": GOOGLE_PLACES_API_KEY},
+                    timeout=10.0,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                result = data.get("result")
+                if result:
+                    geo = result.get("geometry", {}).get("location", {})
+                    place.update({
+                        "place_id": result.get("place_id", ""),
+                        "address": result.get("formatted_address", place.get("address", "")),
+                        "lat": geo.get("lat"),
+                        "lng": geo.get("lng"),
+                        "types": result.get("types", []),
+                        "price_level": result.get("price_level"),
+                        "rating": result.get("rating"),
+                        "phone": result.get("formatted_phone_number", ""),
+                        "website": result.get("website", ""),
+                        "business_status": result.get("business_status", ""),
+                        "enriched": True,
+                    })
+                    return place
+            except Exception as e:
+                logger.error(f"CID lookup error for {place['name']}: {e}")
+
+        # Fallback: Find Place by name
         try:
-            resp = await client.get(url, params=params, timeout=10.0)
+            resp = await client.get(
+                "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
+                params={
+                    "input": place["name"] + (" " + place["address"] if place.get("address") else ""),
+                    "inputtype": "textquery",
+                    "fields": fields,
+                    "key": GOOGLE_PLACES_API_KEY,
+                },
+                timeout=10.0,
+            )
             resp.raise_for_status()
             data = resp.json()
 
