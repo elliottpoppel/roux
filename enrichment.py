@@ -77,14 +77,20 @@ If the article IS about the right restaurant, return a JSON object with these fi
 - "wrong_match": false
 - "summary": 2-3 sentence summary of what makes this place worth going to (or not)
 - "sentiment": "positive", "mixed", or "negative" overall sentiment
-- "dishes": list of dish objects, each with:
+- "dishes": list of dish objects for "{name}", each with:
     - "name": the simple, canonical dish name. Use the most common/menu name. Do NOT include brand names, restaurant names, or marketing language. Examples: "Smashburger" not "The Not a Damn Chance Burger", "French Fries" not "Beef Tallow Fries Beast Mode", "Chocolate Chip Cookie" not "Brown Butter Chocolate Chip Cookies". If two items are the same dish (e.g. "double burger" and "cheeseburger" at a place that only has one burger), merge them into one entry.
     - "sentiment": "must_order", "recommended", "skip", "overhyped", or "mixed"
     - "note": brief context ("lunch only", "seasonal", "not worth the hype", "wagyu beef, American cheese, secret sauce", etc.) — can be null
 - "is_guide": true if this article mentions multiple restaurants (a guide/list), false if single-restaurant review
 - "guide_theme": if is_guide=true, a short description like "Best Burgers in NYC" — else null
+- "guide_places": if is_guide=true, a list of ALL OTHER restaurants mentioned in the article (not "{name}"), each with:
+    - "name": restaurant name
+    - "neighborhood": neighborhood or city (e.g. "Greenwich Village", "Williamsburg", "San Francisco")
+    - "dishes": list of dish objects (same format as above) — include dishes mentioned for this place. Can be empty if none mentioned.
+    - "context": one sentence on why this place is notable in the guide — can be null
 
-IMPORTANT: Keep the dish list tight. Only include genuinely distinct menu items. A place with 3 things on the menu should have ~3 dishes, not 10 variations.
+IMPORTANT: Keep dish lists tight. Only include genuinely distinct menu items.
+IMPORTANT: For guide_places, include EVERY restaurant mentioned in the article, not just the highlights.
 
 Restaurant: {name}
 Address: {address}
@@ -94,6 +100,49 @@ Article text:
 {text}
 
 Return only valid JSON, no other text."""
+
+
+def resolve_place_by_name(name: str, neighborhood: str = "") -> dict | None:
+    """Resolve a restaurant name to Google Places data via Find Place API.
+
+    Returns dict with place_id, name, address, lat, lng, types, rating, or None.
+    """
+    if not GOOGLE_API_KEY or not name:
+        return None
+
+    query = f"{name} {neighborhood}".strip() if neighborhood else name
+    try:
+        resp = httpx.get(
+            "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
+            params={
+                "input": query,
+                "inputtype": "textquery",
+                "fields": "place_id,name,formatted_address,geometry,types,price_level,rating,business_status",
+                "key": GOOGLE_API_KEY,
+            },
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        candidates = resp.json().get("candidates", [])
+        if not candidates:
+            return None
+
+        c = candidates[0]
+        loc = c.get("geometry", {}).get("location", {})
+        return {
+            "place_id": c.get("place_id", ""),
+            "name": c.get("name", name),
+            "address": c.get("formatted_address", ""),
+            "lat": loc.get("lat"),
+            "lng": loc.get("lng"),
+            "types": c.get("types", []),
+            "price_level": c.get("price_level"),
+            "rating": c.get("rating"),
+            "business_status": c.get("business_status"),
+        }
+    except Exception as e:
+        logger.warning(f"Failed to resolve place '{name}': {e}")
+        return None
 
 
 def web_search(query: str, num: int = 5) -> list[dict]:
@@ -165,7 +214,7 @@ def extract_with_llm(place_name: str, title: str, text: str, address: str = "", 
     try:
         message = client.messages.create(
             model="claude-haiku-4-5-20251001",  # Fast and cheap for extraction
-            max_tokens=1024,
+            max_tokens=2048,  # Guides with many places need more output
             messages=[{"role": "user", "content": prompt}],
         )
         raw = message.content[0].text.strip()
@@ -364,7 +413,7 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
                     "note": d.get("note"),
                 })
 
-        # If this is a guide, capture other places mentioned
+        # If this is a guide, capture the primary place and all other places mentioned
         if extracted.get("is_guide") and extracted.get("guide_theme"):
             guide_record = {
                 "source_id": source_id,
@@ -376,11 +425,71 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
             }
             stored_guide = db.upsert_guide(guide_record)
             if stored_guide:
+                # Link primary place to guide
                 db.upsert_guide_mention({
                     "guide_id": stored_guide["id"],
                     "expert_place_id": expert_id,
                     "context": extracted.get("summary", ""),
                 })
+
+                # Process all other places mentioned in the guide
+                for gp in extracted.get("guide_places", []):
+                    gp_name = gp.get("name", "").strip()
+                    if not gp_name:
+                        continue
+
+                    # Resolve via Google Places API
+                    resolved = resolve_place_by_name(gp_name, gp.get("neighborhood", city))
+                    if not resolved or not resolved.get("place_id"):
+                        logger.debug(f"  Guide place not resolved: {gp_name}")
+                        continue
+
+                    # Skip non-dining places
+                    if not is_dining_place(resolved.get("types", [])):
+                        continue
+
+                    # Upsert expert_place (don't set last_enriched_at — this is partial data)
+                    gp_record = {
+                        "google_place_id": resolved["place_id"],
+                        "name": resolved["name"],
+                        "address": resolved.get("address", ""),
+                        "city": gp.get("neighborhood", city),
+                        "lat": resolved.get("lat"),
+                        "lng": resolved.get("lng"),
+                        "place_types": resolved.get("types", []),
+                        "price_level": resolved.get("price_level"),
+                        "google_rating": resolved.get("rating"),
+                    }
+                    stored_gp = db.upsert_expert_place(gp_record)
+                    if not stored_gp:
+                        continue
+
+                    gp_expert_id = stored_gp["id"]
+
+                    # Link to guide
+                    db.upsert_guide_mention({
+                        "guide_id": stored_guide["id"],
+                        "expert_place_id": gp_expert_id,
+                        "context": gp.get("context", ""),
+                    })
+
+                    # Store dishes
+                    gp_dishes = []
+                    for d in gp.get("dishes", []):
+                        if d.get("name"):
+                            gp_dishes.append({
+                                "expert_place_id": gp_expert_id,
+                                "source_id": source_id,
+                                "review_id": review_id,
+                                "dish_name": d.get("name", ""),
+                                "sentiment": d.get("sentiment", "recommended"),
+                                "note": d.get("note"),
+                            })
+                    if gp_dishes:
+                        db.batch_upsert_dishes(gp_expert_id, gp_dishes)
+
+                    logger.info(f"  Guide place: {gp_name} → {resolved['name']} ({len(gp.get('dishes', []))} dishes)")
+                    await asyncio.sleep(0.2)  # Rate limit Google API calls
 
         enriched_any = True
 
