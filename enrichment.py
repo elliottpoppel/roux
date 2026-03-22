@@ -54,7 +54,7 @@ SOURCE_DOMAINS = [
 
 EXTRACTION_PROMPT = """You are extracting structured data from a restaurant review or guide.
 
-FIRST: Check if this article is actually about the restaurant "{name}" at {address}. The article must be about this EXACT restaurant — not a different restaurant with a similar name, not a different location/branch, not a recipe. If it's not about this specific place, return: {{"wrong_match": true}}
+FIRST: Check if this article is actually about the restaurant "{name}" at {address}.{website_hint} The article must be about this EXACT restaurant — not a different restaurant with a similar name, not a different location/branch, not a recipe. If it's not about this specific place, return: {{"wrong_match": true}}
 
 If the article IS about the right restaurant, return a JSON object with these fields:
 - "wrong_match": false
@@ -71,6 +71,7 @@ IMPORTANT: Keep the dish list tight. Only include genuinely distinct menu items.
 
 Restaurant: {name}
 Address: {address}
+Website: {website}
 Article title: {title}
 Article text:
 {text}
@@ -186,7 +187,7 @@ async def fetch_article(url: str) -> tuple[str, str]:
             return "", ""
 
 
-def extract_with_llm(place_name: str, title: str, text: str, address: str = "") -> dict | None:
+def extract_with_llm(place_name: str, title: str, text: str, address: str = "", website: str = "") -> dict | None:
     """Use Claude to extract structured dish/review data from article text."""
     if not ANTHROPIC_API_KEY:
         logger.warning("No ANTHROPIC_API_KEY — skipping LLM extraction")
@@ -194,8 +195,13 @@ def extract_with_llm(place_name: str, title: str, text: str, address: str = "") 
     if len(text) < 100:
         return None
 
+    website_hint = f" The restaurant's website is {website}." if website else ""
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    prompt = EXTRACTION_PROMPT.format(name=place_name, address=address or "unknown", title=title, text=text[:6000])
+    prompt = EXTRACTION_PROMPT.format(
+        name=place_name, address=address or "unknown",
+        website_hint=website_hint, website=website or "unknown",
+        title=title, text=text[:6000],
+    )
 
     try:
         message = client.messages.create(
@@ -241,10 +247,24 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
     place_id = place.get("place_id", "")
     address = place.get("address", "")
     city = place.get("address", "").split(",")[-3].strip() if place.get("address") else ""
+    website = place.get("website", "")
+    google_name = name  # May be overridden by Google Places full name
 
     if not name or not place_id:
         logger.info(f"Skipping {name} — no Google Place ID")
         return False
+
+    # Fetch full details from Google Places API — gets the official name and website
+    try:
+        from server import get_place_details_api
+        details = await get_place_details_api(place_id)
+        if details:
+            google_name = details.get("name", name)
+            website = details.get("website", website)
+            if google_name != name:
+                logger.info(f"  Google name: {google_name}")
+    except Exception:
+        pass
 
     # Check if already in expert DB
     existing = db.get_expert_place(place_id)
@@ -260,7 +280,7 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
         "place_types": place.get("types", []),
         "price_level": place.get("price_level"),
         "google_rating": place.get("rating"),
-        "website": place.get("website", ""),
+        "website": website,
         "phone": place.get("phone", ""),
     }
     stored = db.upsert_expert_place(expert_record)
@@ -277,17 +297,31 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
 
     logger.info(f"Enriching: {name}")
 
-    # Search for reviews — include city to avoid wrong-restaurant matches
+    # Search editorial sources — try multiple strategies for best results
     sites = " OR ".join(f"site:{d}" for d in SOURCE_DOMAINS)
     location_hint = city or address.split(",")[0] if address else ""
-    query = f'"{name}" {location_hint} ({sites})'
-    search_results = web_search(query, num=5)
-    if search_results:
-        # Filter to only approved domains, cap at 3 (diminishing returns after that)
-        search_results = [r for r in search_results if any(d in r.get("url", "") for d in SOURCE_DOMAINS)][:3]
-        logger.info(f"  Processing {len(search_results)} editorial results")
+    # Strategy 1: Google's full name (if more specific than saved name)
+    # Strategy 2: Saved name + location
+    # Strategy 3: Saved name + street (for generic names like "Saint")
+    search_queries = []
+    if google_name != name and len(google_name) > len(name):
+        search_queries.append(f'"{google_name}" ({sites})')
+    search_queries.append(f'"{name}" {location_hint} ({sites})')
+    street = address.split(",")[0].strip() if address else ""
+    if len(name) < 10 and street:
+        search_queries.append(f'"{name}" "{street}" ({sites})')
 
-    if not search_results:
+    search_results = []
+    for query in search_queries:
+        search_results = web_search(query, num=5)
+        if search_results:
+            search_results = [r for r in search_results if any(d in r.get("url", "") for d in SOURCE_DOMAINS)][:3]
+        if search_results:
+            break  # Got results, stop trying
+
+    if search_results:
+        logger.info(f"  Processing {len(search_results)} editorial results")
+    else:
         logger.info(f"No search results for {name}")
         # Mark as enriched (even if no results) so we don't retry every time
         db.upsert_expert_place({**expert_record, "last_enriched_at": "now()"})
@@ -312,7 +346,7 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
         if not text:
             continue
 
-        extracted = extract_with_llm(name, title, text, address=address)
+        extracted = extract_with_llm(name, title, text, address=address, website=website)
         if not extracted:
             continue
         if extracted.get("wrong_match"):
