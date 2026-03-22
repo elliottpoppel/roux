@@ -6,9 +6,10 @@ fetches review content, extracts structured dish data, and stores it in
 the shared Supabase expert knowledge base.
 
 Usage:
-    uv run python enrichment.py                    # enrich all unenriched places
+    uv run python enrichment.py                    # enrich unenriched + outdated places
     uv run python enrichment.py --place "Joe's Pizza"  # enrich a specific place
-    uv run python enrichment.py --all              # re-enrich everything
+    uv run python enrichment.py --all              # re-enrich everything (force)
+    uv run python enrichment.py --upgrade          # re-enrich only outdated pipeline versions
 """
 
 import argparse
@@ -37,6 +38,22 @@ logger = logging.getLogger("roux.enrichment")
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "")
+
+# Bump this when the pipeline changes meaningfully (new sources, prompt changes,
+# search strategy). Places enriched with an older version will be re-enriched
+# automatically on the next run.
+PIPELINE_VERSION = 2
+
+# Google Place types that indicate a dining establishment.
+DINING_TYPES = {
+    "restaurant", "cafe", "bar", "bakery", "meal_delivery",
+    "meal_takeaway", "food", "night_club",
+}
+
+
+def is_dining_place(types: list[str]) -> bool:
+    """Return True if the place types indicate a dining establishment."""
+    return bool(set(types) & DINING_TYPES)
 
 # Sources to search per place (in priority order)
 SOURCE_DOMAINS = [
@@ -100,64 +117,6 @@ def web_search(query: str, num: int = 5) -> list[dict]:
     except Exception as e:
         logger.error(f"Brave Search error: {e}")
     return []
-
-
-SITE_SEARCH_URLS = [
-    # (domain_keyword, search_url_template)
-    ("theinfatuation.com", "https://www.theinfatuation.com/new-york/search?query={query}"),
-    ("eater.com",          "https://ny.eater.com/search?q={query}"),
-    ("grubstreet.com",     "https://www.grubstreet.com/search?q={query}"),
-    ("bonappetit.com",     "https://www.bonappetit.com/search?q={query}"),
-    ("seriouseats.com",    "https://www.seriouseats.com/search?q={query}"),
-    ("timeout.com",        "https://www.timeout.com/newyork/search?q={query}"),
-    ("tastingtable.com",   "https://www.tastingtable.com/search/{query}"),
-]
-
-
-async def search_sources(place_name: str, city: str = "") -> list[dict]:
-    """Search approved editorial sources directly for a place name."""
-    import urllib.parse
-    query = urllib.parse.quote_plus(place_name)
-    results = []
-
-    async with httpx.AsyncClient(
-        follow_redirects=True,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; RouxBot/1.0)"},
-        timeout=10.0,
-    ) as client:
-        for domain_key, url_template in SITE_SEARCH_URLS:
-            url = url_template.format(query=query)
-            try:
-                resp = await client.get(url)
-                if resp.status_code != 200:
-                    continue
-                html = resp.text
-
-                # Extract links from search results that mention the place name
-                import re
-                # Find <a href> links that look like article/review URLs
-                links = re.findall(r'href="(https?://[^"]+(?:review|guide|best|restaurant)[^"]*)"', html, re.IGNORECASE)
-                # Also find links from the same domain
-                domain_links = re.findall(rf'href="(https?://[^"]*{re.escape(domain_key.split(".")[0])}[^"]*)"', html, re.IGNORECASE)
-
-                all_links = list(dict.fromkeys(links + domain_links))  # dedupe, preserve order
-
-                # Filter to links likely about this place
-                name_parts = place_name.lower().split()
-                relevant = []
-                for link in all_links[:10]:
-                    link_lower = link.lower()
-                    if any(part in link_lower for part in name_parts if len(part) > 3):
-                        relevant.append({"url": link, "title": "", "domain": domain_key})
-
-                if relevant:
-                    results.extend(relevant[:2])  # Max 2 per source
-                    logger.info(f"Found {len(relevant)} links for '{place_name}' on {domain_key}")
-
-            except Exception as e:
-                logger.debug(f"Search error for {domain_key}: {e}")
-
-    return results
 
 
 async def fetch_article(url: str) -> tuple[str, str]:
@@ -254,17 +213,24 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
         logger.info(f"Skipping {name} — no Google Place ID")
         return False
 
-    # Fetch full details from Google Places API — gets the official name and website
-    try:
-        from server import get_place_details_api
-        details = await get_place_details_api(place_id)
-        if details:
-            google_name = details.get("name", name)
-            website = details.get("website", website)
-            if google_name != name:
-                logger.info(f"  Google name: {google_name}")
-    except Exception:
-        pass
+    # Skip non-dining places
+    if not is_dining_place(place.get("types", [])):
+        logger.info(f"Skipping {name} — not a dining place (types: {place.get('types', [])})")
+        return False
+
+    # Only call Google Places Details API if we're missing the website
+    # (import already stored name, address, types, rating, etc.)
+    if not website:
+        try:
+            from server import get_place_details_api
+            details = await get_place_details_api(place_id)
+            if details:
+                google_name = details.get("name", name)
+                website = details.get("website", website)
+                if google_name != name:
+                    logger.info(f"  Google name: {google_name}")
+        except Exception:
+            pass
 
     # Check if already in expert DB
     existing = db.get_expert_place(place_id)
@@ -290,10 +256,12 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
 
     expert_id = stored["id"]
 
-    # Skip full enrichment if already enriched recently (unless forced)
-    if not force and existing and existing.get("last_enriched_at"):
-        logger.info(f"Already enriched: {name}")
-        return True
+    # Skip if already enriched with current pipeline version (unless forced)
+    if not force and existing:
+        existing_version = existing.get("pipeline_version", 0) or 0
+        if existing_version >= PIPELINE_VERSION:
+            logger.info(f"Already enriched (v{existing_version}): {name}")
+            return True
 
     logger.info(f"Enriching: {name}")
 
@@ -324,30 +292,45 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
     else:
         logger.info(f"No search results for {name}")
         # Mark as enriched (even if no results) so we don't retry every time
-        db.upsert_expert_place({**expert_record, "last_enriched_at": "now()"})
+        db.upsert_expert_place({**expert_record, "last_enriched_at": "now()", "pipeline_version": PIPELINE_VERSION})
         return True
 
     enriched_any = False
     all_extracted_dishes = []
+
+    # Build list of articles to process (filter to approved sources)
+    to_fetch = []
     for result in search_results:
         url = result.get("url", "")
-        if not url:
+        if not url or not any(domain in url for domain in SOURCE_DOMAINS):
             continue
-
-        # Only process URLs from approved sources
-        if not any(domain in url for domain in SOURCE_DOMAINS):
-            continue
-
         source_id = get_source_id_for_url(url)
-        if not source_id:
-            continue
+        if source_id:
+            to_fetch.append((url, source_id))
 
-        title, text = await fetch_article(url)
-        if not text:
-            continue
+    # Fetch all articles concurrently
+    fetch_results = await asyncio.gather(
+        *[fetch_article(url) for url, _ in to_fetch],
+        return_exceptions=True,
+    )
 
-        extracted = extract_with_llm(name, title, text, address=address, website=website)
-        if not extracted:
+    # Extract structured data from all articles concurrently (LLM calls)
+    extract_tasks = []
+    fetched_articles = []
+    for (url, source_id), result in zip(to_fetch, fetch_results):
+        if isinstance(result, Exception) or not result[1]:
+            continue
+        title, text = result
+        fetched_articles.append((url, source_id, title, text))
+        extract_tasks.append(
+            asyncio.to_thread(extract_with_llm, name, title, text, address, website)
+        )
+
+    extracted_results = await asyncio.gather(*extract_tasks, return_exceptions=True)
+
+    # Process results and write to DB
+    for (url, source_id, title, text), extracted in zip(fetched_articles, extracted_results):
+        if isinstance(extracted, Exception) or not extracted:
             continue
         if extracted.get("wrong_match"):
             logger.info(f"  Skipping wrong match: {title[:60]}")
@@ -361,7 +344,7 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
             "title": title,
             "sentiment": extracted.get("sentiment"),
             "summary": extracted.get("summary"),
-            "raw_text": text[:2000],  # Store truncated version
+            "raw_text": text[:2000],
         }
         stored_review = db.upsert_review(review)
         if not stored_review:
@@ -370,8 +353,7 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
         review_id = stored_review["id"]
 
         # Collect dishes for batch dedup after all articles processed
-        dishes = extracted.get("dishes", [])
-        for d in dishes:
+        for d in extracted.get("dishes", []):
             if d.get("name"):
                 all_extracted_dishes.append({
                     "expert_place_id": expert_id,
@@ -406,12 +388,31 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
     if all_extracted_dishes:
         db.batch_upsert_dishes(expert_id, all_extracted_dishes)
 
-    # Mark as enriched
-    db.upsert_expert_place({**expert_record, "last_enriched_at": "now()"})
+    # Mark as enriched with current pipeline version
+    db.upsert_expert_place({**expert_record, "last_enriched_at": "now()", "pipeline_version": PIPELINE_VERSION})
     return enriched_any
 
 
-async def run_enrichment(filter_name: str | None = None, force: bool = False, user_id: str | None = None):
+def _enrichment_priority(place: dict, home_city: str = "") -> tuple:
+    """Sort key for enrichment priority (lower = higher priority)."""
+    # Places with food-related user notes first
+    note = f"{place.get('note', '')} {place.get('comment', '')}".lower()
+    food_keywords = {"order", "try", "dish", "burger", "pizza", "taco", "ramen",
+                     "sushi", "pasta", "cocktail", "wine", "delicious", "amazing",
+                     "must", "best", "favorite", "recommend"}
+    has_food_note = 0 if any(kw in note for kw in food_keywords) else 1
+
+    # Home city places next
+    city_match = 0 if home_city and home_city.lower() in place.get("address", "").lower() else 1
+
+    # Higher-rated places first (more editorial coverage)
+    rating = -(place.get("rating") or 0)
+
+    return (has_food_note, city_match, rating)
+
+
+async def run_enrichment(filter_name: str | None = None, force: bool = False,
+                         user_id: str | None = None, upgrade: bool = False):
     """Run enrichment pipeline across saved places."""
     if not db.get_client():
         logger.error("No Supabase connection — check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY")
@@ -421,24 +422,41 @@ async def run_enrichment(filter_name: str | None = None, force: bool = False, us
     if user_id:
         places = db.load_user_places(user_id)
     else:
-        # Enrich places for all users
         client = db.get_client()
         all_users = client.table("users").select("id").execute()
         places = []
         for u in (all_users.data or []):
             places.extend(db.load_user_places(u["id"]))
+
+    # Filter to dining places only
+    total_before = len(places)
+    places = [p for p in places if p.get("place_id") and is_dining_place(p.get("types", []))]
+    skipped = total_before - len(places)
+    if skipped:
+        logger.info(f"Skipped {skipped} non-dining places")
+
     if filter_name:
         places = [p for p in places if filter_name.lower() in p.get("name", "").lower()]
         logger.info(f"Filtered to {len(places)} places matching '{filter_name}'")
-    else:
-        if not force:
-            # Only process places not yet in expert DB
-            unenriched = []
-            for p in places:
-                if p.get("place_id") and not db.get_expert_place(p["place_id"]):
-                    unenriched.append(p)
-            places = unenriched
-        logger.info(f"Enriching {len(places)} places")
+    elif not force:
+        # Filter to places that need enrichment: unenriched OR outdated pipeline version
+        needs_enrichment = []
+        for p in places:
+            existing = db.get_expert_place(p["place_id"])
+            if not existing:
+                needs_enrichment.append(p)
+            elif upgrade or (existing.get("pipeline_version", 0) or 0) < PIPELINE_VERSION:
+                needs_enrichment.append(p)
+        places = needs_enrichment
+
+    logger.info(f"Enriching {len(places)} dining places (pipeline v{PIPELINE_VERSION})")
+
+    # Sort by priority: food notes first, then home city, then by rating
+    home_city = ""
+    if user_id:
+        locations = db.get_user_locations(user_id)
+        home_city = locations.get("home", "")
+    places.sort(key=lambda p: _enrichment_priority(p, home_city))
 
     success = 0
     for i, place in enumerate(places):
@@ -456,8 +474,12 @@ async def run_enrichment(filter_name: str | None = None, force: bool = False, us
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Roux enrichment pipeline")
     parser.add_argument("--place", help="Enrich a specific place by name")
-    parser.add_argument("--all", action="store_true", help="Re-enrich all places")
+    parser.add_argument("--all", action="store_true", help="Re-enrich all places (force)")
+    parser.add_argument("--upgrade", action="store_true", help="Re-enrich only places with outdated pipeline version")
     parser.add_argument("--user-id", help="Enrich places for a specific user ID")
     args = parser.parse_args()
 
-    asyncio.run(run_enrichment(filter_name=args.place, force=args.all, user_id=args.user_id))
+    asyncio.run(run_enrichment(
+        filter_name=args.place, force=args.all,
+        user_id=args.user_id, upgrade=args.upgrade,
+    ))

@@ -8,6 +8,7 @@ through Claude.
 https://github.com/poppel/roux
 """
 
+import asyncio
 import csv
 import io
 import json
@@ -632,9 +633,15 @@ async def search_places(
     results = []
     query_lower = query.lower()
 
+    from enrichment import is_dining_place
+
     for p in places:
         # Skip permanently closed places
         if p.get("business_status") == "CLOSED_PERMANENTLY":
+            continue
+
+        # Skip non-dining places — Roux is a dining concierge
+        if not is_dining_place(p.get("types", [])):
             continue
 
         relevance = 0  # Higher = more relevant to this query
@@ -702,6 +709,13 @@ async def search_places(
             lines.append("\n**You might also like:**\n")
             for r in new_places:
                 lines.append(format_discovery_card(r))
+
+    # Enrichment-in-progress signal
+    from enrichment import is_dining_place
+    dining_places = [p for p in places if p.get("place_id") and is_dining_place(p.get("types", []))]
+    enriched_count = sum(1 for p in dining_places if db.get_expert_place(p["place_id"]))
+    if dining_places and enriched_count < len(dining_places):
+        lines.append(f"\n*Still enriching your places ({enriched_count}/{len(dining_places)} dining places done) — dish recommendations will appear as they're ready.*")
 
     return "\n\n".join(lines)
 
@@ -797,6 +811,15 @@ async def place_details(place_name: str) -> str:
     return "\n".join(lines)
 
 
+async def _background_enrich(user_id: str):
+    """Run editorial enrichment in the background after import."""
+    try:
+        from enrichment import run_enrichment
+        await run_enrichment(user_id=user_id)
+    except Exception as e:
+        logger.error(f"Background enrichment error: {e}")
+
+
 @mcp.tool()
 async def import_places(csv_content: str, list_name: str = "default") -> str:
     """Import saved places from a Google Takeout CSV file.
@@ -865,7 +888,9 @@ async def import_places(csv_content: str, list_name: str = "default") -> str:
     lines.append(f"  Total places: {total}")
 
     if added:
-        lines.append(f"\nYour places are being enriched with expert reviews and dish recommendations from sources like The Infatuation, NYT, Eater, and more. This runs in the background and can take a while for large lists. You can start asking questions right away — recommendations will get richer as enrichment completes.")
+        lines.append(f"\nYour places are being enriched with expert reviews and dish recommendations from sources like The Infatuation, NYT, Eater, and more. This runs in the background — you can start asking questions right away. Recommendations will get richer as enrichment completes.")
+        # Actually launch background enrichment
+        asyncio.create_task(_background_enrich(user_id))
 
     return "\n".join(lines)
 
@@ -973,9 +998,19 @@ async def my_stats() -> str:
                 city = parts[-3] if len(parts) >= 4 else parts[-2]
                 cities[city] = cities.get(city, 0) + 1
 
+    # Count dining places and editorial enrichment
+    from enrichment import is_dining_place
+    dining_count = sum(1 for p in places if is_dining_place(p.get("types", [])))
+    expert_enriched = sum(
+        1 for p in places
+        if p.get("place_id") and is_dining_place(p.get("types", []))
+        and db.get_expert_place(p["place_id"])
+    )
+
     lines = ["**Your Places Database**\n"]
-    lines.append(f"Total places: {total}")
+    lines.append(f"Total places: {total} ({dining_count} dining, {total - dining_count} other)")
     lines.append(f"Enriched with Google data: {enriched}/{total}")
+    lines.append(f"Expert reviews: {expert_enriched}/{dining_count} dining places")
 
     if lists:
         lines.append("\n**By list:**")
