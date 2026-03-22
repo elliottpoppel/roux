@@ -500,6 +500,71 @@ def search_dishes_by_keyword(keyword: str) -> set[str]:
     }
 
 
+def discover_places(keyword: str, exclude_place_ids: set[str] | None = None, limit: int = 5) -> list[dict]:
+    """Search the shared places database for discovery — places not in the user's saves.
+
+    Searches place_dishes by keyword, then returns full place records from the
+    places table, excluding any google_place_ids in exclude_place_ids.
+    """
+    client = get_client()
+    if not client or not keyword:
+        return []
+
+    # Search dishes for keyword matches → get matching place IDs
+    dish_results = (
+        client.table("place_dishes")
+        .select("expert_place_id, places(google_place_id, name, address, city, lat, lng, place_types, price_level, google_rating, website)")
+        .ilike("dish_name", f"%{keyword}%")
+        .limit(200)
+        .execute()
+    )
+
+    # Dedupe by google_place_id, exclude user's saved places
+    seen = set()
+    discoveries = []
+    exclude = exclude_place_ids or set()
+    for r in (dish_results.data or []):
+        place = r.get("places")
+        if not place or not place.get("google_place_id"):
+            continue
+        gpid = place["google_place_id"]
+        if gpid in seen or gpid in exclude:
+            continue
+        seen.add(gpid)
+        discoveries.append(place)
+
+    # Also search place names directly
+    name_results = (
+        client.table("places")
+        .select("google_place_id, name, address, city, lat, lng, place_types, price_level, google_rating, website")
+        .ilike("name", f"%{keyword}%")
+        .limit(50)
+        .execute()
+    )
+    for place in (name_results.data or []):
+        gpid = place.get("google_place_id", "")
+        if gpid and gpid not in seen and gpid not in exclude:
+            seen.add(gpid)
+            discoveries.append(place)
+
+    return discoveries[:limit]
+
+
+def find_place_by_name(name: str) -> dict | None:
+    """Search the shared places database by name. Returns the best match or None."""
+    client = get_client()
+    if not client:
+        return None
+    result = client.table("places").select("*").ilike("name", f"%{name}%").limit(5).execute()
+    if not result.data:
+        return None
+    # Prefer exact match, then first result
+    for r in result.data:
+        if r.get("name", "").lower() == name.lower():
+            return r
+    return result.data[0]
+
+
 def search_expert_by_dish(dish_query: str, city: str | None = None) -> list[dict]:
     """Find expert places known for a specific dish or drink."""
     db = get_client()

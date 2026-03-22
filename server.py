@@ -61,8 +61,8 @@ through setup:
    3. Click 'Next step' → 'Create export'
    4. When the download is ready (usually 2-5 min), download and unzip it
    5. Inside you'll see a Saved folder with CSV files — drop them all here"
-3. Even without saved places, Roux can discover restaurants. Don't block \
-the user from using Roux before they import.
+3. Even without saved places, Roux may have discovered restaurants from \
+editorial guides. Don't block the user from using Roux before they import.
 
 When a user shares a location naturally (e.g. "I live in the West Village"), \
 save it with locations(action="save") without asking for confirmation.
@@ -86,7 +86,8 @@ Don't drop any. Don't add places the tool didn't return.
 - The tool handles curation. Your job is presentation: voice, brief commentary \
 (1-2 sentences per place), and preserving the card structure. Don't rewrite \
 cards as prose paragraphs.
-- Always present both saved places AND discoveries ("You might also like"). \
+- Results come in two tiers: saved places (user's own) and discoveries (from \
+Roux's shared database of editorially-backed places). Always present both. \
 Never silently drop the discovery section.
 - Every recommendation should name specific dishes.
 - User notes are first-class — interweave and enrich them with expert data, \
@@ -553,14 +554,17 @@ def format_place_card(p: dict, distance: float | None = None, saved: bool = Fals
     return line
 
 
-def format_discovery_card(r: dict) -> str:
-    """Format a Google Places discovery result as a card."""
+def format_discovery_card(r: dict, query: str = "") -> str:
+    """Format a discovered place as a card. Works with both Google API and Roux DB results."""
     parts = [f"**{r.get('name', 'Unknown')}**"]
-    if r.get("rating"):
-        parts.append(f"{r['rating']}★")
+    rating = r.get("rating") or r.get("google_rating")
+    if rating:
+        parts.append(f"{rating}★")
     if r.get("price_level"):
         parts.append("$" * r["price_level"])
-    address = r.get("vicinity") or r.get("formatted_address", "")
+    if r.get("_distance") and r["_distance"] < 999:
+        parts.append(f"{r['_distance']:.1f} mi")
+    address = r.get("vicinity") or r.get("formatted_address") or r.get("address", "")
     if address:
         neighborhood = _extract_neighborhood(address)
         if neighborhood:
@@ -569,8 +573,13 @@ def format_discovery_card(r: dict) -> str:
 
     if address:
         line += f"\n{address}"
-    if r.get("opening_hours", {}).get("open_now") is not None:
-        line += f"\nOpen now: {'Yes' if r['opening_hours']['open_now'] else 'No'}"
+
+    # Add expert dish recommendations if available
+    place_id = r.get("google_place_id") or r.get("place_id")
+    if place_id:
+        expert = format_expert_knowledge(place_id, query=query, detailed=False)
+        if expert:
+            line += f"\n{expert}"
 
     return line
 
@@ -698,25 +707,27 @@ async def search_places(
             saved_names.add(p.get("name", "").lower())
             lines.append(format_place_card(p, r.get("distance"), saved=True, query=query))
 
-    # Auto-discover new places — use effective_near, or infer from saved results
-    discovery_coords = near_coords
-    if not discovery_coords and results:
-        # Infer location from the closest saved results
-        lats = [r["place"]["lat"] for r in results[:5] if r["place"].get("lat")]
-        lngs = [r["place"]["lng"] for r in results[:5] if r["place"].get("lng")]
-        if lats and lngs:
-            discovery_coords = {"lat": sum(lats) / len(lats), "lng": sum(lngs) / len(lngs)}
-    if discovery_coords and GOOGLE_PLACES_API_KEY:
-        search_query = query or "restaurant"
-        saved_names_lower = {p.get("name", "").lower() for p in places}
-        discovery = await search_nearby_api(discovery_coords["lat"], discovery_coords["lng"], query=search_query, radius=3000)
-        if not discovery and effective_near:
-            discovery = await text_search_api(f"{search_query} near {effective_near}")
-        new_places = [r for r in (discovery or []) if r.get("name", "").lower() not in saved_names_lower][:3]
-        if new_places:
+    # Discover places from Roux's shared database (not Google API)
+    if query:
+        saved_place_ids = {p.get("place_id") for p in places if p.get("place_id")}
+        discoveries = db.discover_places(query, exclude_place_ids=saved_place_ids, limit=5)
+
+        # If we have coordinates, sort by distance and filter
+        if near_coords and discoveries:
+            for d in discoveries:
+                if d.get("lat") and d.get("lng"):
+                    d["_distance"] = haversine(near_coords["lat"], near_coords["lng"], d["lat"], d["lng"])
+                else:
+                    d["_distance"] = 999
+            discoveries.sort(key=lambda d: d["_distance"])
+            if max_distance_miles > 0:
+                discoveries = [d for d in discoveries if d["_distance"] <= max_distance_miles]
+
+        discoveries = discoveries[:3]
+        if discoveries:
             lines.append("\n**You might also like:**\n")
-            for r in new_places:
-                lines.append(format_discovery_card(r))
+            for d in discoveries:
+                lines.append(format_discovery_card(d, query=query))
 
     # Enrichment-in-progress signal (single batch query)
     from enrichment import is_dining_place
@@ -750,6 +761,12 @@ async def place_details(place_name: str) -> str:
             break
 
     place_id = saved.get("place_id") if saved else None
+
+    # Search Roux's shared database before falling back to Google API
+    if not place_id:
+        roux_match = db.find_place_by_name(place_name)
+        if roux_match:
+            place_id = roux_match.get("google_place_id")
 
     if not place_id and GOOGLE_PLACES_API_KEY:
         results = await text_search_api(place_name)
