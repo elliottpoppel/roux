@@ -192,6 +192,15 @@ def get_expert_place(google_place_id: str) -> dict | None:
     return result.data[0] if result.data else None
 
 
+def get_enriched_place_ids(google_place_ids: list[str]) -> set[str]:
+    """Return the subset of google_place_ids that have expert_places records. Single query."""
+    db = get_client()
+    if not db or not google_place_ids:
+        return set()
+    result = db.table("expert_places").select("google_place_id").in_("google_place_id", google_place_ids).execute()
+    return {r["google_place_id"] for r in (result.data or [])}
+
+
 def upsert_expert_place(place: dict) -> dict | None:
     """Insert or update an expert place. Returns the stored record."""
     db = get_client()

@@ -718,12 +718,12 @@ async def search_places(
             for r in new_places:
                 lines.append(format_discovery_card(r))
 
-    # Enrichment-in-progress signal
+    # Enrichment-in-progress signal (single batch query)
     from enrichment import is_dining_place
-    dining_places = [p for p in places if p.get("place_id") and is_dining_place(p.get("types", []))]
-    enriched_count = sum(1 for p in dining_places if db.get_expert_place(p["place_id"]))
-    if dining_places and enriched_count < len(dining_places):
-        lines.append(f"\n*Still enriching your places ({enriched_count}/{len(dining_places)} dining places done) — dish recommendations will appear as they're ready.*")
+    dining_place_ids = [p["place_id"] for p in places if p.get("place_id") and is_dining_place(p.get("types", []))]
+    enriched_ids = db.get_enriched_place_ids(dining_place_ids) if dining_place_ids else set()
+    if dining_place_ids and len(enriched_ids) < len(dining_place_ids):
+        lines.append(f"\n*Still enriching your places ({len(enriched_ids)}/{len(dining_place_ids)} dining places done) — dish recommendations will appear as they're ready.*")
 
     return "\n\n".join(lines)
 
@@ -1006,14 +1006,12 @@ async def my_stats() -> str:
                 city = parts[-3] if len(parts) >= 4 else parts[-2]
                 cities[city] = cities.get(city, 0) + 1
 
-    # Count dining places and editorial enrichment
+    # Count dining places and editorial enrichment (single batch query)
     from enrichment import is_dining_place
-    dining_count = sum(1 for p in places if is_dining_place(p.get("types", [])))
-    expert_enriched = sum(
-        1 for p in places
-        if p.get("place_id") and is_dining_place(p.get("types", []))
-        and db.get_expert_place(p["place_id"])
-    )
+    dining_place_ids = [p["place_id"] for p in places if p.get("place_id") and is_dining_place(p.get("types", []))]
+    dining_count = len(dining_place_ids)
+    enriched_ids = db.get_enriched_place_ids(dining_place_ids) if dining_place_ids else set()
+    expert_enriched = len(enriched_ids)
 
     lines = ["**Your Places Database**\n"]
     lines.append(f"Total places: {total} ({dining_count} dining, {total - dining_count} other)")
