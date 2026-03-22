@@ -12,7 +12,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
 # Copy application code
-COPY server.py personal_auth.py db.py CLAUDE.md ./
+COPY server.py personal_auth.py db.py enrichment.py CLAUDE.md ./
 
 # Create data directory for places database and taste profile.
 # For personal deployments, put your places.json and taste-profile.md
