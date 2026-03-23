@@ -151,8 +151,16 @@ def resolve_place_by_name(name: str, neighborhood: str = "") -> dict | None:
         return None
 
 
+class BraveQuotaExhausted(Exception):
+    """Raised when Brave Search returns 402 — monthly quota exhausted."""
+    pass
+
+
 def web_search(query: str, num: int = 5) -> list[dict]:
-    """Search using Brave Search API — free tier, 2000 queries/month."""
+    """Search using Brave Search API — free tier, 2000 queries/month.
+
+    Raises BraveQuotaExhausted on 402 to stop the enrichment run.
+    """
     api_key = os.environ.get("BRAVE_SEARCH_API_KEY", "")
     if not api_key:
         logger.warning("No BRAVE_SEARCH_API_KEY set — skipping search")
@@ -165,10 +173,14 @@ def web_search(query: str, num: int = 5) -> list[dict]:
             headers={"X-Subscription-Token": api_key, "Accept": "application/json"},
             timeout=10.0,
         )
+        if resp.status_code == 402:
+            raise BraveQuotaExhausted("Brave Search monthly quota exhausted (402)")
         resp.raise_for_status()
         results = resp.json().get("web", {}).get("results", [])
         return [{"title": r.get("title", ""), "url": r.get("url", ""),
                  "snippet": r.get("description", "")} for r in results]
+    except BraveQuotaExhausted:
+        raise  # Don't catch this — let it propagate up
     except Exception as e:
         logger.error(f"Brave Search error: {e}")
     return []
@@ -529,6 +541,9 @@ async def run_enrichment(filter_name: str | None = None, force: bool = False,
         try:
             if await enrich_one_place(place, force=force, skip_guides=skip_guides):
                 success += 1
+        except BraveQuotaExhausted:
+            logger.error(f"Brave Search quota exhausted — stopping enrichment at place {i+1}/{len(places)}")
+            break
         except Exception as e:
             logger.error(f"Error enriching {place.get('name')}: {e}")
 
