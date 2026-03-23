@@ -1,15 +1,20 @@
 """
-Roux — Expert enrichment pipeline.
+Roux — Enrichment pipeline.
 
 For each place in the user's saved list, searches approved editorial sources,
 fetches review content, extracts structured dish data, and stores it in
-the shared Supabase expert knowledge base.
+the shared Supabase places database.
+
+Guide processing is decoupled: during enrichment, guide data is stored but
+not resolved. Run --guides-only to process stored guides in batch.
 
 Usage:
     uv run python enrichment.py                    # enrich unenriched + outdated places
     uv run python enrichment.py --place "Joe's Pizza"  # enrich a specific place
     uv run python enrichment.py --all              # re-enrich everything (force)
     uv run python enrichment.py --upgrade          # re-enrich only outdated pipeline versions
+    uv run python enrichment.py --no-guides        # enrich without guide extraction
+    uv run python enrichment.py --guides-only      # process stored guides (no enrichment)
 """
 
 import argparse
@@ -19,6 +24,7 @@ import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -249,7 +255,7 @@ def get_source_id_for_url(url: str) -> str | None:
     return None
 
 
-async def enrich_one_place(place: dict, force: bool = False) -> bool:
+async def enrich_one_place(place: dict, force: bool = False, skip_guides: bool = False) -> bool:
     """Enrich a single saved place with expert knowledge. Returns True if enriched."""
     name = place.get("name", "")
     place_id = place.get("place_id", "")
@@ -413,8 +419,8 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
                     "note": d.get("note"),
                 })
 
-        # If this is a guide, capture the primary place and all other places mentioned
-        if extracted.get("is_guide") and extracted.get("guide_theme"):
+        # If this is a guide, store it with the extracted places data for batch processing later
+        if not skip_guides and extracted.get("is_guide") and extracted.get("guide_theme"):
             guide_record = {
                 "source_id": source_id,
                 "url": url,
@@ -422,74 +428,18 @@ async def enrich_one_place(place: dict, force: bool = False) -> bool:
                 "theme": extracted["guide_theme"],
                 "city": city,
                 "scope": "city" if city else "national",
+                "guide_places": json.dumps(extracted.get("guide_places", [])),
             }
             stored_guide = db.upsert_guide(guide_record)
             if stored_guide:
-                # Link primary place to guide
                 db.upsert_guide_mention({
                     "guide_id": stored_guide["id"],
                     "expert_place_id": expert_id,
                     "context": extracted.get("summary", ""),
                 })
-
-                # Process all other places mentioned in the guide
-                for gp in extracted.get("guide_places", []):
-                    gp_name = gp.get("name", "").strip()
-                    if not gp_name:
-                        continue
-
-                    # Resolve via Google Places API
-                    resolved = resolve_place_by_name(gp_name, gp.get("neighborhood", city))
-                    if not resolved or not resolved.get("place_id"):
-                        logger.debug(f"  Guide place not resolved: {gp_name}")
-                        continue
-
-                    # Skip non-dining places
-                    if not is_dining_place(resolved.get("types", [])):
-                        continue
-
-                    # Upsert place (don't set last_enriched_at — this is partial data)
-                    gp_record = {
-                        "google_place_id": resolved["place_id"],
-                        "name": resolved["name"],
-                        "address": resolved.get("address", ""),
-                        "city": gp.get("neighborhood", city),
-                        "lat": resolved.get("lat"),
-                        "lng": resolved.get("lng"),
-                        "place_types": resolved.get("types", []),
-                        "price_level": resolved.get("price_level"),
-                        "google_rating": resolved.get("rating"),
-                    }
-                    stored_gp = db.upsert_place(gp_record)
-                    if not stored_gp:
-                        continue
-
-                    gp_expert_id = stored_gp["id"]
-
-                    # Link to guide
-                    db.upsert_guide_mention({
-                        "guide_id": stored_guide["id"],
-                        "expert_place_id": gp_expert_id,
-                        "context": gp.get("context", ""),
-                    })
-
-                    # Store dishes
-                    gp_dishes = []
-                    for d in gp.get("dishes", []):
-                        if d.get("name"):
-                            gp_dishes.append({
-                                "expert_place_id": gp_expert_id,
-                                "source_id": source_id,
-                                "review_id": review_id,
-                                "dish_name": d.get("name", ""),
-                                "sentiment": d.get("sentiment", "recommended"),
-                                "note": d.get("note"),
-                            })
-                    if gp_dishes:
-                        db.batch_upsert_dishes(gp_expert_id, gp_dishes)
-
-                    logger.info(f"  Guide place: {gp_name} → {resolved['name']} ({len(gp.get('dishes', []))} dishes)")
-                    await asyncio.sleep(0.2)  # Rate limit Google API calls
+                gp_count = len(extracted.get("guide_places", []))
+                if gp_count:
+                    logger.info(f"  Guide stored: {extracted['guide_theme']} ({gp_count} places for later processing)")
 
         enriched_any = True
 
@@ -521,7 +471,8 @@ def _enrichment_priority(place: dict, home_city: str = "") -> tuple:
 
 
 async def run_enrichment(filter_name: str | None = None, force: bool = False,
-                         user_id: str | None = None, upgrade: bool = False):
+                         user_id: str | None = None, upgrade: bool = False,
+                         skip_guides: bool = False):
     """Run enrichment pipeline across saved places."""
     if not db.get_client():
         logger.error("No Supabase connection — check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY")
@@ -548,10 +499,13 @@ async def run_enrichment(filter_name: str | None = None, force: bool = False,
         places = [p for p in places if filter_name.lower() in p.get("name", "").lower()]
         logger.info(f"Filtered to {len(places)} places matching '{filter_name}'")
     elif not force:
-        # Filter to places that need enrichment: unenriched OR outdated pipeline version
+        # Batch query: get all existing place records in one call
+        place_ids = [p["place_id"] for p in places]
+        existing_places = db.get_places_by_ids(place_ids)  # {google_place_id: record}
+
         needs_enrichment = []
         for p in places:
-            existing = db.get_place(p["place_id"])
+            existing = existing_places.get(p["place_id"])
             if not existing:
                 needs_enrichment.append(p)
             elif upgrade or (existing.get("pipeline_version", 0) or 0) < PIPELINE_VERSION:
@@ -568,16 +522,197 @@ async def run_enrichment(filter_name: str | None = None, force: bool = False,
     places.sort(key=lambda p: _enrichment_priority(p, home_city))
 
     success = 0
+    start_time = time.time()
     for i, place in enumerate(places):
+        place_start = time.time()
         logger.info(f"[{i+1}/{len(places)}] {place.get('name')}")
         try:
-            if await enrich_one_place(place, force=force):
+            if await enrich_one_place(place, force=force, skip_guides=skip_guides):
                 success += 1
         except Exception as e:
             logger.error(f"Error enriching {place.get('name')}: {e}")
-        await asyncio.sleep(2)  # Be respectful to search engine
 
-    logger.info(f"Enrichment complete: {success}/{len(places)} places enriched")
+        # Progress summary every 10 places
+        if (i + 1) % 10 == 0:
+            elapsed = time.time() - start_time
+            avg_per_place = elapsed / (i + 1)
+            remaining = avg_per_place * (len(places) - i - 1)
+            logger.info(
+                f"Progress: {i+1}/{len(places)} done, {success} enriched, "
+                f"{elapsed:.0f}s elapsed, ~{remaining:.0f}s remaining "
+                f"({avg_per_place:.1f}s/place)"
+            )
+
+        await asyncio.sleep(0.5)  # Rate limit Brave Search
+
+    elapsed = time.time() - start_time
+    logger.info(f"Enrichment complete: {success}/{len(places)} places enriched in {elapsed:.0f}s")
+
+
+async def process_guides(user_id: str | None = None):
+    """Process stored guide data in batch — resolve places, store dishes and mentions.
+
+    This is decoupled from enrichment so it can run separately and benefit from
+    deduplication and caching across all guides.
+    """
+    if not db.get_client():
+        logger.error("No Supabase connection")
+        return
+
+    client = db.get_client()
+
+    # Load all guides that have unprocessed guide_places data
+    result = client.table("guides").select("*").not_.is_("guide_places", "null").execute()
+    guides = [g for g in (result.data or []) if g.get("guide_places")]
+    logger.info(f"Found {len(guides)} guides with place data to process")
+
+    if not guides:
+        return
+
+    # In-memory cache: name+neighborhood → resolved place data (avoids duplicate API calls)
+    resolve_cache: dict[str, dict | None] = {}
+    # Persistent cache: check DB before API
+    known_places: set[str] = set()  # google_place_ids already in DB
+
+    # Pre-load all known place names from DB for persistent cache
+    all_places = client.table("places").select("google_place_id, name").execute()
+    name_to_place_id: dict[str, str] = {}
+    for p in (all_places.data or []):
+        known_places.add(p["google_place_id"])
+        name_to_place_id[p.get("name", "").lower()] = p["google_place_id"]
+
+    # Track which guides we've already fully processed (idempotent)
+    processed_guide_ids: set[str] = set()
+    # A guide is "processed" if all its guide_places have been resolved
+    # We'll mark this by clearing guide_places after processing
+
+    total_places_resolved = 0
+    total_dishes_stored = 0
+    total_api_calls = 0
+    start_time = time.time()
+
+    for gi, guide in enumerate(guides):
+        guide_id = guide["id"]
+        source_id = guide.get("source_id")
+        theme = guide.get("theme", "")
+
+        # Parse stored guide_places JSON
+        try:
+            guide_places = json.loads(guide["guide_places"]) if isinstance(guide["guide_places"], str) else guide["guide_places"]
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(f"Invalid guide_places JSON for guide {guide_id}")
+            continue
+
+        if not guide_places:
+            continue
+
+        # Deduplicate: skip if we've already processed a guide with the same URL
+        guide_url = guide.get("url", "")
+        if guide_url in processed_guide_ids:
+            continue
+        processed_guide_ids.add(guide_url)
+
+        logger.info(f"[{gi+1}/{len(guides)}] Processing guide: {theme} ({len(guide_places)} places)")
+
+        for gp in guide_places:
+            gp_name = gp.get("name", "").strip()
+            if not gp_name:
+                continue
+
+            neighborhood = gp.get("neighborhood", guide.get("city", ""))
+            cache_key = f"{gp_name.lower()}|{neighborhood.lower()}"
+
+            # Check in-memory cache first
+            if cache_key in resolve_cache:
+                resolved = resolve_cache[cache_key]
+            else:
+                # Check persistent cache (DB) by name
+                existing_pid = name_to_place_id.get(gp_name.lower())
+                if existing_pid:
+                    # Already in DB — just need the record
+                    resolved = {"place_id": existing_pid}
+                    existing_record = db.get_place(existing_pid)
+                    if existing_record:
+                        resolved = {
+                            "place_id": existing_pid,
+                            "name": existing_record.get("name", gp_name),
+                            "address": existing_record.get("address", ""),
+                            "types": existing_record.get("place_types", []),
+                        }
+                else:
+                    # Call Google API
+                    resolved = resolve_place_by_name(gp_name, neighborhood)
+                    total_api_calls += 1
+
+                resolve_cache[cache_key] = resolved
+
+            if not resolved or not resolved.get("place_id"):
+                continue
+
+            # Skip non-dining
+            if resolved.get("types") and not is_dining_place(resolved["types"]):
+                continue
+
+            place_id = resolved["place_id"]
+
+            # Upsert place record (don't set last_enriched_at — partial data)
+            if place_id not in known_places:
+                gp_record = {
+                    "google_place_id": place_id,
+                    "name": resolved.get("name", gp_name),
+                    "address": resolved.get("address", ""),
+                    "city": neighborhood,
+                    "lat": resolved.get("lat"),
+                    "lng": resolved.get("lng"),
+                    "place_types": resolved.get("types", []),
+                    "price_level": resolved.get("price_level"),
+                    "google_rating": resolved.get("rating"),
+                }
+                stored_gp = db.upsert_place(gp_record)
+                if stored_gp:
+                    known_places.add(place_id)
+                    name_to_place_id[gp_name.lower()] = place_id
+                    total_places_resolved += 1
+                else:
+                    continue
+
+            # Get expert_place_id for this place
+            place_record = db.get_place(place_id)
+            if not place_record:
+                continue
+            gp_expert_id = place_record["id"]
+
+            # Link to guide
+            db.upsert_guide_mention({
+                "guide_id": guide_id,
+                "expert_place_id": gp_expert_id,
+                "context": gp.get("context", ""),
+            })
+
+            # Store dishes
+            gp_dishes = []
+            for d in gp.get("dishes", []):
+                if d.get("name"):
+                    gp_dishes.append({
+                        "expert_place_id": gp_expert_id,
+                        "source_id": source_id,
+                        "dish_name": d.get("name", ""),
+                        "sentiment": d.get("sentiment", "recommended"),
+                        "note": d.get("note"),
+                    })
+            if gp_dishes:
+                db.batch_upsert_dishes(gp_expert_id, gp_dishes)
+                total_dishes_stored += len(gp_dishes)
+
+        # Mark guide as processed by clearing guide_places
+        client.table("guides").update({"guide_places": None}).eq("id", guide_id).execute()
+
+    elapsed = time.time() - start_time
+    logger.info(
+        f"Guide processing complete: {len(processed_guide_ids)} guides, "
+        f"{total_places_resolved} new places, {total_dishes_stored} dishes, "
+        f"{total_api_calls} API calls, {elapsed:.0f}s"
+    )
 
 
 if __name__ == "__main__":
@@ -585,10 +720,16 @@ if __name__ == "__main__":
     parser.add_argument("--place", help="Enrich a specific place by name")
     parser.add_argument("--all", action="store_true", help="Re-enrich all places (force)")
     parser.add_argument("--upgrade", action="store_true", help="Re-enrich only places with outdated pipeline version")
+    parser.add_argument("--no-guides", action="store_true", help="Skip guide extraction during enrichment")
+    parser.add_argument("--guides-only", action="store_true", help="Process stored guides only (no enrichment)")
     parser.add_argument("--user-id", help="Enrich places for a specific user ID")
     args = parser.parse_args()
 
-    asyncio.run(run_enrichment(
-        filter_name=args.place, force=args.all,
-        user_id=args.user_id, upgrade=args.upgrade,
-    ))
+    if args.guides_only:
+        asyncio.run(process_guides(user_id=args.user_id))
+    else:
+        asyncio.run(run_enrichment(
+            filter_name=args.place, force=args.all,
+            user_id=args.user_id, upgrade=args.upgrade,
+            skip_guides=args.no_guides,
+        ))

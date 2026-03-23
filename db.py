@@ -201,6 +201,15 @@ def get_enriched_place_ids(google_place_ids: list[str]) -> set[str]:
     return {r["google_place_id"] for r in (result.data or [])}
 
 
+def get_places_by_ids(google_place_ids: list[str]) -> dict[str, dict]:
+    """Return places records keyed by google_place_id. Single batch query."""
+    db = get_client()
+    if not db or not google_place_ids:
+        return {}
+    result = db.table("places").select("*").in_("google_place_id", google_place_ids).execute()
+    return {r["google_place_id"]: r for r in (result.data or [])}
+
+
 def upsert_place(place: dict) -> dict | None:
     """Insert or update an expert place. Returns the stored record."""
     db = get_client()
